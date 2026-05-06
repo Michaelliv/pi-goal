@@ -1,6 +1,6 @@
 {
   "name": "pi-goal",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Persistent autonomous goals for pi — /goal loops until complete, paused, or budget-limited",
   "type": "commonjs",
   "keywords": [

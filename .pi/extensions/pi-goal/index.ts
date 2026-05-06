@@ -137,10 +137,23 @@ function updateStatusBar(ctx: ExtensionContext) {
 	ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
 }
 
+const GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
+
+// Expose goal tools to the LLM only while a goal is actively being pursued.
+// When no goal exists (or it is paused / complete / budget-limited), keep them
+// hidden so unrelated sessions are not tempted to call them every turn.
+function syncGoalTools(pi: ExtensionAPI) {
+	const want = goal?.status === "active";
+	const active = new Set(pi.getActiveTools());
+	for (const name of GOAL_TOOL_NAMES) (want ? active.add(name) : active.delete(name));
+	pi.setActiveTools(Array.from(active));
+}
+
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
 	goal = next;
 	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
 	updateStatusBar(ctx);
+	syncGoalTools(pi);
 }
 
 function persistSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
@@ -247,7 +260,10 @@ export default function piGoal(pi: ExtensionAPI) {
 		name: "get_goal",
 		label: "Get Goal",
 		description: "Read the current active thread goal, if one exists.",
-		promptSnippet: "Read the current thread goal and budget state",
+		promptSnippet: "Read the current pi-goal objective and remaining budget while pursuing it",
+		promptGuidelines: [
+			"Only call get_goal when you actually need the current objective or remaining budget; the continuation prompt already injects them.",
+		],
 		parameters: {
 			type: "object",
 			properties: {},
@@ -383,6 +399,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		pendingControlPrompt = null;
 		continuationQueued = false;
 		activeTurnStartedAt = null;
+		// Hide goal tools from the LLM unless we have an active goal to pursue.
+		syncGoalTools(pi);
 		if (goal?.status === "active" && event.reason === "reload") {
 			goal = { ...goal, status: "paused", updatedAt: Date.now() };
 			persist(pi, ctx, goal);
