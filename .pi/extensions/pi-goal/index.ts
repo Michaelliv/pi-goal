@@ -21,9 +21,14 @@ type GoalState = {
 type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
 let goal: GoalState | null = null;
+let pendingGoals: GoalState[] = [];
 let statusBarEnabled = true;
 let activeTurnStartedAt: number | null = null;
 let continuationQueued = false;
+
+function freshGoalId(): string {
+	return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function parseTokenBudget(input: string): { objective: string; tokenBudget: number | null; error?: string } {
 	const match = input.match(/(?:^|\s)--tokens(?:=|\s+)([0-9]+(?:\.[0-9]+)?\s*[kKmM]?)(?:\s|$)/);
@@ -58,12 +63,14 @@ function formatElapsed(seconds: number): string {
 }
 
 function statusLine(state: GoalState | null): string | undefined {
-	if (!state) return undefined;
+	const queued = pendingGoals.length;
+	const queueSuffix = queued > 0 ? ` +${queued} queued` : "";
+	if (!state) return queued > 0 ? `${queued} goal${queued === 1 ? "" : "s"} queued (/goal next promote)` : undefined;
 	const budget = state.tokenBudget ? ` (${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)})` : ` (${formatElapsed(state.timeUsedSeconds)})`;
-	if (state.status === "active") return `Pursuing goal${budget}`;
-	if (state.status === "paused") return "Goal paused (/goal resume)";
-	if (state.status === "budget_limited") return state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned";
-	return `Goal achieved${budget}`;
+	if (state.status === "active") return `Pursuing goal${budget}${queueSuffix}`;
+	if (state.status === "paused") return `Goal paused (/goal resume)${queueSuffix}`;
+	if (state.status === "budget_limited") return `${state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned"}${queueSuffix}`;
+	return `Goal achieved${budget}${queueSuffix}`;
 }
 
 function goalUsage(state: GoalState): string {
@@ -142,18 +149,20 @@ function emitGoalEvent(
 	);
 }
 
-function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null; statusBarEnabled: boolean } {
+function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null; pendingGoals: GoalState[]; statusBarEnabled: boolean } {
 	const entries = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i] as any;
 		if (entry.type === "custom" && entry.customType === CUSTOM_TYPE) {
+			const pending = Array.isArray(entry.data?.pendingGoals) ? (entry.data.pendingGoals as GoalState[]) : [];
 			return {
 				goal: entry.data?.goal ?? null,
+				pendingGoals: pending,
 				statusBarEnabled: entry.data?.statusBarEnabled ?? true,
 			};
 		}
 	}
-	return { goal: null, statusBarEnabled: true };
+	return { goal: null, pendingGoals: [], statusBarEnabled: true };
 }
 
 function updateStatusBar(ctx: ExtensionContext) {
@@ -174,14 +183,41 @@ function syncGoalTools(pi: ExtensionAPI) {
 
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
 	goal = next;
-	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
+	pi.appendEntry(CUSTOM_TYPE, { goal: next, pendingGoals, statusBarEnabled });
 	updateStatusBar(ctx);
 	syncGoalTools(pi);
 }
 
 function persistSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
-	pi.appendEntry(CUSTOM_TYPE, { goal, statusBarEnabled });
+	pi.appendEntry(CUSTOM_TYPE, { goal, pendingGoals, statusBarEnabled });
 	updateStatusBar(ctx);
+}
+
+// Promote the head of the pending queue to active. Used after the current goal
+// completes naturally, after /goal clear, or via explicit /goal next promote.
+// Budget hits intentionally do NOT auto-promote — a budget_limited goal was
+// not finished, so the user has to opt in to moving on.
+function promoteNextGoal(pi: ExtensionAPI, ctx: ExtensionContext): GoalState | null {
+	const head = pendingGoals.shift();
+	if (!head) {
+		// Still persist if the queue snapshot changed elsewhere; cheap.
+		persistSettings(pi, ctx);
+		return null;
+	}
+	const now = Date.now();
+	const next: GoalState = {
+		...head,
+		id: freshGoalId(),
+		status: "active",
+		tokensUsed: 0,
+		timeUsedSeconds: 0,
+		createdAt: now,
+		updatedAt: now,
+	};
+	persist(pi, ctx, next);
+	emitGoalEvent(pi, "active", next, { triggerTurn: ctx.isIdle() });
+	ctx.ui.notify(`→ Starting next goal: ${truncateObjective(next.objective)}`, "info");
+	return next;
 }
 
 function continuationPrompt(state: GoalState): string {
@@ -319,6 +355,8 @@ export default function piGoal(pi: ExtensionAPI) {
 			const next: GoalState = { ...goal, status: "complete", updatedAt: now };
 			persist(pi, ctx, next);
 			emitGoalEvent(pi, "complete", next);
+			// If the user pre-queued a follow-up via /goal next, start it now.
+			promoteNextGoal(pi, ctx);
 			return {
 				content: [{ type: "text", text: JSON.stringify({ goal: next, remainingTokens: next.tokenBudget == null ? null : Math.max(0, next.tokenBudget - next.tokensUsed) }, null, 2) }],
 				details: { goal: next },
@@ -327,9 +365,22 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("goal", {
-		description: "Set, view, pause, resume, clear, or configure a long-running goal",
+		description: "Set, view, pause, resume, clear, queue, or configure a long-running goal",
 		getArgumentCompletions: (prefix) => {
-			const values = ["pause", "resume", "clear", "status", "statusbar", "statusbar on", "statusbar off"];
+			const values = [
+				"pause",
+				"resume",
+				"clear",
+				"status",
+				"statusbar",
+				"statusbar on",
+				"statusbar off",
+				"next",
+				"next list",
+				"next clear",
+				"next pop",
+				"next promote",
+			];
 			const filtered = values.filter((value) => value.startsWith(prefix));
 			return filtered.length ? filtered.map((value) => ({ value, label: value })) : null;
 		},
@@ -338,8 +389,18 @@ export default function piGoal(pi: ExtensionAPI) {
 			const now = Date.now();
 
 			if (!trimmed || trimmed === "status") {
-				if (!goal) ctx.ui.notify("Usage: /goal [--tokens 50k] <objective>", "info");
-				else ctx.ui.notify(`${statusLine(goal)}\nObjective: ${goal.objective}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`, "info");
+				const lines: string[] = [];
+				if (!goal) lines.push("Usage: /goal [--tokens 50k] <objective>");
+				else lines.push(`${statusLine(goal)}\nObjective: ${goal.objective}\nStatus bar: ${statusBarEnabled ? "on" : "off"}`);
+				if (pendingGoals.length > 0) {
+					lines.push("");
+					lines.push(`Queued (${pendingGoals.length}):`);
+					pendingGoals.forEach((g, i) => {
+						const budget = g.tokenBudget ? ` (--tokens ${formatTokens(g.tokenBudget)})` : "";
+						lines.push(`  ${i + 1}. ${truncateObjective(g.objective)}${budget}`);
+					});
+				}
+				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
 
@@ -351,6 +412,102 @@ export default function piGoal(pi: ExtensionAPI) {
 				return;
 			}
 
+			// /goal next ... — manage the pending queue.
+			if (trimmed === "next" || trimmed === "next list") {
+				if (pendingGoals.length === 0) {
+					ctx.ui.notify("No queued goals. Usage: /goal next [--tokens 50k] <objective>", "info");
+					return;
+				}
+				const lines = [`Queued (${pendingGoals.length}):`];
+				pendingGoals.forEach((g, i) => {
+					const budget = g.tokenBudget ? ` (--tokens ${formatTokens(g.tokenBudget)})` : "";
+					lines.push(`  ${i + 1}. ${truncateObjective(g.objective)}${budget}`);
+				});
+				ctx.ui.notify(lines.join("\n"), "info");
+				return;
+			}
+
+			if (trimmed === "next clear") {
+				if (pendingGoals.length === 0) {
+					ctx.ui.notify("No queued goals.", "info");
+					return;
+				}
+				const count = pendingGoals.length;
+				pendingGoals = [];
+				persistSettings(pi, ctx);
+				ctx.ui.notify(`Cleared ${count} queued goal${count === 1 ? "" : "s"}.`, "info");
+				return;
+			}
+
+			if (trimmed === "next pop") {
+				const removed = pendingGoals.shift();
+				if (!removed) {
+					ctx.ui.notify("No queued goals.", "info");
+					return;
+				}
+				persistSettings(pi, ctx);
+				ctx.ui.notify(`Removed from queue: ${truncateObjective(removed.objective)}`, "info");
+				return;
+			}
+
+			if (trimmed === "next promote") {
+				if (pendingGoals.length === 0) {
+					ctx.ui.notify("No queued goals to promote.", "warning");
+					return;
+				}
+				if (goal && goal.status !== "complete") {
+					const head = pendingGoals[0];
+					const ok = await ctx.ui.confirm(
+						"Promote next goal?",
+						`Current (${goal.status}): ${goal.objective}\n\nNext: ${head.objective}\n\nThe current goal will be cleared.`,
+					);
+					if (!ok) return;
+					const previous = goal;
+					persist(pi, ctx, null);
+					emitGoalEvent(pi, "cleared", previous);
+				}
+				promoteNextGoal(pi, ctx);
+				return;
+			}
+
+			if (trimmed.startsWith("next ") || trimmed === "next") {
+				// /goal next <objective> [--tokens N] — append to queue.
+				const body = trimmed.slice("next".length).trim();
+				const parsed = parseTokenBudget(body);
+				if (parsed.error) {
+					ctx.ui.notify(parsed.error, "warning");
+					return;
+				}
+				if (!parsed.objective) {
+					ctx.ui.notify("Usage: /goal next [--tokens 50k] <objective>", "warning");
+					return;
+				}
+				const entry: GoalState = {
+					version: 1,
+					id: freshGoalId(),
+					objective: parsed.objective,
+					status: "active",
+					tokenBudget: parsed.tokenBudget,
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: now,
+					updatedAt: now,
+				};
+				// If nothing is active, just start it now — same effect as /goal <obj>.
+				if (!goal || goal.status === "complete") {
+					persist(pi, ctx, entry);
+					emitGoalEvent(pi, "active", entry, { triggerTurn: ctx.isIdle() });
+					return;
+				}
+				pendingGoals.push(entry);
+				persistSettings(pi, ctx);
+				ctx.ui.notify(
+					`Queued goal #${pendingGoals.length}: ${truncateObjective(entry.objective)}\nIt will start when the current goal completes or is cleared.`,
+					"info",
+				);
+				return;
+			}
+
 			if (trimmed === "clear") {
 				if (!goal) {
 					ctx.ui.notify("No goal is set.", "info");
@@ -359,6 +516,8 @@ export default function piGoal(pi: ExtensionAPI) {
 				const previous = goal;
 				persist(pi, ctx, null);
 				emitGoalEvent(pi, "cleared", previous);
+				// /goal clear is an explicit "move on"; promote any queued goal.
+				promoteNextGoal(pi, ctx);
 				return;
 			}
 
@@ -385,12 +544,13 @@ export default function piGoal(pi: ExtensionAPI) {
 				return;
 			}
 			if (goal && goal.status !== "complete") {
-				const ok = await ctx.ui.confirm("Replace goal?", `Current: ${goal.objective}\n\nNew: ${parsed.objective}`);
+				const queueNote = pendingGoals.length > 0 ? `\n\nQueued: ${pendingGoals.length} (kept)` : "";
+				const ok = await ctx.ui.confirm("Replace goal?", `Current: ${goal.objective}\n\nNew: ${parsed.objective}${queueNote}`);
 				if (!ok) return;
 			}
 			const next: GoalState = {
 				version: 1,
-				id: `${now}-${Math.random().toString(16).slice(2)}`,
+				id: freshGoalId(),
 				objective: parsed.objective,
 				status: "active",
 				tokenBudget: parsed.tokenBudget,
@@ -407,6 +567,7 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		const restored = latestStateFromSession(ctx);
 		goal = restored.goal;
+		pendingGoals = restored.pendingGoals;
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
 		activeTurnStartedAt = null;
