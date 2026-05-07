@@ -73,6 +73,8 @@ function goalUsage(state: GoalState): string {
 
 type UsageSnapshot = { totalTokens?: number; input?: number; output?: number } | null | undefined;
 
+type AssistantMessageSnapshot = { usage?: UsageSnapshot; stopReason?: string } | undefined;
+
 function tokenDeltaFromUsage(usage: UsageSnapshot): number {
 	if (!usage) return 0;
 	if (typeof usage.totalTokens === "number") return Math.max(0, usage.totalTokens);
@@ -444,13 +446,30 @@ export default function piGoal(pi: ExtensionAPI) {
 		if (!goal || goal.status !== "active") return;
 		const elapsed = activeTurnStartedAt ? Math.max(0, Math.round((Date.now() - activeTurnStartedAt) / 1000)) : 0;
 		activeTurnStartedAt = null;
-		const tokenDelta = tokenDeltaFromUsage((event.message as { usage?: UsageSnapshot } | undefined)?.usage);
+		const message = event.message as AssistantMessageSnapshot;
+		const tokenDelta = tokenDeltaFromUsage(message?.usage);
+		const aborted = message?.stopReason === "aborted";
 		let next: GoalState = {
 			...goal,
 			tokensUsed: goal.tokensUsed + tokenDelta,
 			timeUsedSeconds: goal.timeUsedSeconds + elapsed,
 			updatedAt: Date.now(),
 		};
+		// User-triggered abort (escape, /abort, ctx.abort()) should pause the
+		// goal so the next agent_end does not silently queue another
+		// continuation. Budget accounting still happens — tokens spent on the
+		// aborted turn are real — but we skip the budget_limited transition
+		// and the budget prompt; the goal is paused regardless.
+		if (aborted) {
+			next = { ...next, status: "paused" };
+			persist(pi, ctx, next);
+			emitGoalEvent(pi, "paused", next, { deliverAs: "nextTurn" });
+			ctx.ui.notify(
+				`‖ Goal paused after escape: ${truncateObjective(next.objective)}\nUse /goal resume to continue, or /goal clear to stop.`,
+				"info",
+			);
+			return;
+		}
 		if (next.tokenBudget != null && next.tokensUsed >= next.tokenBudget) {
 			next = { ...next, status: "budget_limited" };
 		}
