@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Box, Spacer, Text } from "@mariozechner/pi-tui";
+import { tokenDeltaFromUsage } from "./usage";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
@@ -69,18 +70,6 @@ function statusLine(state: GoalState | null): string | undefined {
 function goalUsage(state: GoalState): string {
 	if (state.tokenBudget != null) return `${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)} tokens`;
 	return formatElapsed(state.timeUsedSeconds);
-}
-
-type UsageSnapshot = { totalTokens?: number; input?: number; output?: number; cacheRead?: number; cacheWrite?: number } | null | undefined;
-
-function tokenDeltaFromUsage(usage: UsageSnapshot): number {
-	if (!usage) return 0;
-	if (typeof usage.totalTokens === "number") return Math.max(0, usage.totalTokens);
-	const input = Number(usage.input) || 0;
-	const output = Number(usage.output) || 0;
-	const cacheRead = Number(usage.cacheRead) || 0;
-	const cacheWrite = Number(usage.cacheWrite) || 0;
-	return Math.max(0, input + output + cacheRead + cacheWrite);
 }
 
 function truncateObjective(objective: string, max = 96): string {

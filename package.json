@@ -24,8 +24,12 @@
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
   },
+  "devDependencies": {
+    "jiti": "^2.7.0"
+  },
   "scripts": {
     "check": "pi --no-extensions -e ./.pi/extensions/pi-goal/index.ts --list-models __pi_goal_load_check__",
+    "test": "node --test test/**/*.test.cjs",
     "pack:dry": "npm pack --dry-run"
   },
   "author": "michaelliv",
