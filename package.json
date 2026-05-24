@@ -12,12 +12,16 @@
   ],
   "files": [
     ".pi/",
+    "skills/",
     "README.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
       ".pi/extensions/pi-goal"
+    ],
+    "skills": [
+      "skills"
     ]
   },
   "peerDependencies": {
