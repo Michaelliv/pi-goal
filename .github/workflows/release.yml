@@ -17,6 +17,8 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      - name: Run tests
+        run: npm test
       - name: Check extension loads
         run: npm run check
 
