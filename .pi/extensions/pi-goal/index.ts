@@ -1,94 +1,28 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Box, Spacer, Text } from "@mariozechner/pi-tui";
-import { tokenDeltaFromUsage } from "./usage";
+import {
+	accountGoalTurn,
+	createGoalState,
+	goalEventStatus,
+	goalUsage,
+	parseTokenBudget,
+	statusLine,
+	truncateObjective,
+	type GoalEventKind,
+	type GoalState,
+	type GoalStatus,
+	normalizeTokenBudget,
+} from "./goal-state";
+import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
 
-type GoalStatus = "active" | "paused" | "budget_limited" | "complete";
-
-type GoalState = {
-	version: 1;
-	id: string;
-	objective: string;
-	status: GoalStatus;
-	tokenBudget: number | null;
-	tokensUsed: number;
-	timeUsedSeconds: number;
-	createdAt: number;
-	updatedAt: number;
-};
-
-type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
-
 let goal: GoalState | null = null;
 let statusBarEnabled = true;
 let activeTurnStartedAt: number | null = null;
+let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
-
-function parseTokenBudget(input: string): { objective: string; tokenBudget: number | null; error?: string } {
-	const match = input.match(/(?:^|\s)--tokens(?:=|\s+)([0-9]+(?:\.[0-9]+)?\s*[kKmM]?)(?:\s|$)/);
-	if (!match) return { objective: input.trim(), tokenBudget: null };
-
-	const raw = match[1].replace(/\s+/g, "");
-	const suffix = raw.slice(-1).toLowerCase();
-	const numeric = suffix === "k" || suffix === "m" ? raw.slice(0, -1) : raw;
-	const value = Number(numeric);
-	if (!Number.isFinite(value) || value <= 0) {
-		return { objective: input.trim(), tokenBudget: null, error: "Token budget must be positive." };
-	}
-	const multiplier = suffix === "m" ? 1_000_000 : suffix === "k" ? 1_000 : 1;
-	const tokenBudget = Math.round(value * multiplier);
-	const objective = (input.slice(0, match.index) + " " + input.slice((match.index ?? 0) + match[0].length)).trim();
-	return { objective, tokenBudget };
-}
-
-function formatTokens(value: number): string {
-	if (value >= 1_000_000) return `${Math.round(value / 100_000) / 10}M`;
-	if (value >= 1_000) return `${Math.round(value / 100) / 10}K`;
-	return String(value);
-}
-
-function formatElapsed(seconds: number): string {
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m`;
-	const hours = Math.floor(minutes / 60);
-	const remMinutes = minutes % 60;
-	return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`;
-}
-
-function statusLine(state: GoalState | null): string | undefined {
-	if (!state) return undefined;
-	const budget = state.tokenBudget ? ` (${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)})` : ` (${formatElapsed(state.timeUsedSeconds)})`;
-	if (state.status === "active") return `Pursuing goal${budget}`;
-	if (state.status === "paused") return "Goal paused (/goal resume)";
-	if (state.status === "budget_limited") return state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned";
-	return `Goal achieved${budget}`;
-}
-
-function goalUsage(state: GoalState): string {
-	if (state.tokenBudget != null) return `${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)} tokens`;
-	return formatElapsed(state.timeUsedSeconds);
-}
-
-function truncateObjective(objective: string, max = 96): string {
-	const singleLine = objective.replace(/\s+/g, " ").trim();
-	return singleLine.length > max ? `${singleLine.slice(0, max - 1)}…` : singleLine;
-}
-
-function goalEventStatus(kind: GoalEventKind): string {
-	const labels: Record<GoalEventKind, string> = {
-		active: "active",
-		continuation: "continuing",
-		paused: "paused",
-		resumed: "resumed",
-		cleared: "cleared",
-		budget_limited: "budget reached",
-		complete: "achieved",
-	};
-	return labels[kind];
-}
 
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
@@ -153,20 +87,24 @@ function updateStatusBar(ctx: ExtensionContext) {
 	ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
 }
 
-const GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
+const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
 
-// Expose goal tools to the LLM only while a goal is actively being pursued.
-// When no goal exists (or it is paused / complete / budget-limited), keep them
-// hidden so unrelated sessions are not tempted to call them every turn.
+// Expose read/update tools to the LLM only while a goal is actively being pursued.
+// Keep create_goal available so the model can start a goal when explicitly asked,
+// but rely on its tool contract to reject inferred goals and existing goals.
 function syncGoalTools(pi: ExtensionAPI) {
-	const want = goal?.status === "active";
+	const wantActiveTools = goal?.status === "active";
 	const active = new Set(pi.getActiveTools());
-	for (const name of GOAL_TOOL_NAMES) (want ? active.add(name) : active.delete(name));
+	active.add("create_goal");
+	for (const name of ACTIVE_GOAL_TOOL_NAMES) (wantActiveTools ? active.add(name) : active.delete(name));
 	pi.setActiveTools(Array.from(active));
 }
 
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
 	goal = next;
+	if (next?.status !== "active") {
+		continuationQueued = false;
+	}
 	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
 	updateStatusBar(ctx);
 	syncGoalTools(pi);
@@ -205,7 +143,7 @@ Before deciding that the goal is achieved, perform a completion audit against th
 - Identify any missing, incomplete, weakly verified, or uncovered requirement.
 - Treat uncertainty as not achieved; do more verification or continue the work.
 
-Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call update_goal with status \"complete\".
+Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call update_goal with status \"complete\" so usage accounting is preserved.
 
 Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.`;
 }
@@ -281,9 +219,63 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "create_goal",
+		label: "Create Goal",
+		description: "Create a new active thread goal only when explicitly requested. A goal must be a durable, evidence-checkable work contract: outcome, verification surface, constraints, boundaries, iteration policy, and blocked stop condition. Fails if a goal already exists.",
+		promptSnippet: "Create a pi-goal objective only when the user explicitly requests goal mode",
+		promptGuidelines: [
+			"Use create_goal only when the user explicitly asks to set/start/follow a goal, or system/developer instructions require a goal.",
+			"Do not infer goals from ordinary coding tasks or one-off prompts.",
+			"Before creating a goal, turn the request into a concrete objective with: outcome, verification surface, constraints, boundaries, iteration policy, and blocked stop condition.",
+			"Use this objective shape when possible: <desired end state>, verified by <specific evidence>, while preserving <constraints>. Use <allowed scope/tools> and avoid <forbidden scope>. Between iterations, <how to choose the next action and what to re-check>. If blocked or no defensible path remains, stop with <evidence gathered, attempted paths, blocker, and next input needed>.",
+			"Prefer a self-contained objective that survives continuation turns and context compaction.",
+			"Do not create vague goals like 'improve this' or 'finish the feature'; ask a clarifying question if missing success criteria or boundaries materially affect the contract.",
+			"Set tokenBudget only when the user explicitly requested a token budget.",
+		],
+		parameters: {
+			type: "object",
+			properties: {
+				objective: {
+					type: "string",
+					description: "The concrete objective to pursue as an active thread goal.",
+				},
+				tokenBudget: {
+					type: "number",
+					description: "Optional positive token budget for the goal, only when explicitly requested.",
+				},
+			},
+			required: ["objective"],
+			additionalProperties: false,
+		} as any,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (goal) {
+				return {
+					content: [{ type: "text", text: "Cannot create a new goal because this thread already has a goal. Use update_goal only when the existing goal is complete, or ask the user to clear/replace it." }],
+					isError: true,
+				};
+			}
+			const objective = typeof params.objective === "string" ? params.objective.trim() : "";
+			if (!objective) {
+				return { content: [{ type: "text", text: "objective is required." }], isError: true };
+			}
+			const parsedBudget = normalizeTokenBudget(params.tokenBudget);
+			if (parsedBudget.error) {
+				return { content: [{ type: "text", text: parsedBudget.error }], isError: true };
+			}
+			const next = createGoalState(objective, parsedBudget.tokenBudget);
+			persist(pi, ctx, next);
+			emitGoalEvent(pi, "active", next, { triggerTurn: ctx.isIdle() });
+			return {
+				content: [{ type: "text", text: JSON.stringify({ goal: next, remainingTokens: next.tokenBudget }, null, 2) }],
+				details: { goal: next },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "update_goal",
 		label: "Update Goal",
-		description: "Mark the current thread goal complete. This tool only accepts status=complete.",
+		description: "Mark the current thread goal complete. This tool only accepts status=complete and final turn usage is accounted by the runtime.",
 		promptSnippet: "Mark the current goal complete after a strict completion audit",
 		promptGuidelines: [
 			"Use update_goal only when the current pi-goal objective is fully achieved and verified against concrete evidence.",
@@ -381,17 +373,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				const ok = await ctx.ui.confirm("Replace goal?", `Current: ${goal.objective}\n\nNew: ${parsed.objective}`);
 				if (!ok) return;
 			}
-			const next: GoalState = {
-				version: 1,
-				id: `${now}-${Math.random().toString(16).slice(2)}`,
-				objective: parsed.objective,
-				status: "active",
-				tokenBudget: parsed.tokenBudget,
-				tokensUsed: 0,
-				timeUsedSeconds: 0,
-				createdAt: now,
-				updatedAt: now,
-			};
+			const next = createGoalState(parsed.objective, parsed.tokenBudget, now);
 			persist(pi, ctx, next);
 			emitGoalEvent(pi, "active", next, { triggerTurn: ctx.isIdle() });
 		},
@@ -403,7 +385,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
 		activeTurnStartedAt = null;
-		// Hide goal tools from the LLM unless we have an active goal to pursue.
+		activeGoalThisTurnId = null;
+		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
 		syncGoalTools(pi);
 		if (goal?.status === "active" && event.reason === "reload") {
 			// Reload pauses an active goal so it does not silently resume.
@@ -431,22 +414,20 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("turn_start", (_event, _ctx) => {
 		activeTurnStartedAt = Date.now();
+		activeGoalThisTurnId = goal?.status === "active" ? goal.id : null;
 	});
 
 	pi.on("turn_end", (event, ctx) => {
-		if (!goal || goal.status !== "active") return;
+		if (!goal || activeGoalThisTurnId !== goal.id) {
+			activeTurnStartedAt = null;
+			activeGoalThisTurnId = null;
+			return;
+		}
 		const elapsed = activeTurnStartedAt ? Math.max(0, Math.round((Date.now() - activeTurnStartedAt) / 1000)) : 0;
 		activeTurnStartedAt = null;
+		activeGoalThisTurnId = null;
 		const tokenDelta = tokenDeltaFromUsage((event.message as { usage?: UsageSnapshot } | undefined)?.usage);
-		let next: GoalState = {
-			...goal,
-			tokensUsed: goal.tokensUsed + tokenDelta,
-			timeUsedSeconds: goal.timeUsedSeconds + elapsed,
-			updatedAt: Date.now(),
-		};
-		if (next.tokenBudget != null && next.tokensUsed >= next.tokenBudget) {
-			next = { ...next, status: "budget_limited" };
-		}
+		const next = accountGoalTurn(goal, tokenDelta, elapsed);
 		persist(pi, ctx, next);
 		if (next.status === "budget_limited") {
 			emitGoalEvent(pi, "budget_limited", next, { triggerTurn: true, deliverAs: "followUp" });
