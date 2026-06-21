@@ -90,8 +90,7 @@ function updateStatusBar(ctx: ExtensionContext) {
 const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
 
 // Expose read/update tools to the LLM only while a goal is actively being pursued.
-// Keep create_goal available so the model can start a goal when explicitly asked,
-// but rely on its tool contract to reject inferred goals and existing goals.
+// Keep create_goal available so the model can set or replace a goal when explicitly asked.
 function syncGoalTools(pi: ExtensionAPI) {
 	const wantActiveTools = goal?.status === "active";
 	const active = new Set(pi.getActiveTools());
@@ -221,7 +220,7 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "create_goal",
 		label: "Create Goal",
-		description: "Create a new active thread goal only when explicitly requested. A goal must be a durable, evidence-checkable work contract: outcome, verification surface, constraints, boundaries, iteration policy, and blocked stop condition. Fails if a goal already exists.",
+		description: "Create a new active thread goal only when explicitly requested. It sets or replaces the current thread goal. A goal must be a durable, evidence-checkable work contract: outcome, verification surface, constraints, boundaries, iteration policy, and blocked stop condition.",
 		promptSnippet: "Create a pi-goal objective only when the user explicitly requests goal mode",
 		promptGuidelines: [
 			"Use create_goal only when the user explicitly asks to set/start/follow a goal, or system/developer instructions require a goal.",
@@ -230,6 +229,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			"Use this objective shape when possible: <desired end state>, verified by <specific evidence>, while preserving <constraints>. Use <allowed scope/tools> and avoid <forbidden scope>. Between iterations, <how to choose the next action and what to re-check>. If blocked or no defensible path remains, stop with <evidence gathered, attempted paths, blocker, and next input needed>.",
 			"Prefer a self-contained objective that survives continuation turns and context compaction.",
 			"Do not create vague goals like 'improve this' or 'finish the feature'; ask a clarifying question if missing success criteria or boundaries materially affect the contract.",
+			"When called, create_goal replaces any existing goal with the new objective; only call it when the user explicitly asked to set, start, change, or replace a goal.",
 			"Set tokenBudget only when the user explicitly requested a token budget.",
 		],
 		parameters: {
@@ -248,12 +248,6 @@ export default function piGoal(pi: ExtensionAPI) {
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (goal) {
-				return {
-					content: [{ type: "text", text: "Cannot create a new goal because this thread already has a goal. Use update_goal only when the existing goal is complete, or ask the user to clear/replace it." }],
-					isError: true,
-				};
-			}
 			const objective = typeof params.objective === "string" ? params.objective.trim() : "";
 			if (!objective) {
 				return { content: [{ type: "text", text: "objective is required." }], isError: true };

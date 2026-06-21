@@ -20,13 +20,20 @@ test("create_goal tool carries strong goal-writing contract", () => {
 	}
 });
 
+test("create_goal uses upsert semantics for explicitly requested goals", () => {
+	assert.match(indexSource, /sets or replaces the current thread goal/);
+	assert.match(indexSource, /When called, create_goal replaces any existing goal with the new objective/);
+	assert.doesNotMatch(indexSource, /replaceExisting/);
+	assert.doesNotMatch(indexSource, /This thread already has a goal/);
+});
+
 test("update_goal remains completion-only in schema and guidance", () => {
 	assert.match(indexSource, /name: "update_goal"/);
 	assert.match(indexSource, /enum: \["complete"\]/);
 	assert.match(indexSource, /Do not use update_goal to pause, resume, abandon, or budget-limit a goal/);
 });
 
-test("README documents the model-created goal and completion accounting contracts", () => {
-	assert.match(readme, /`create_goal` tool: model can create a goal only when explicitly requested and only if no goal exists/);
+test("README documents the model-set goal and completion accounting contracts", () => {
+	assert.match(readme, /`create_goal` tool: model can set or replace the current goal only when explicitly requested/);
 	assert.match(readme, /The final turn is still accounted even when the model completes the goal mid-turn/);
 });

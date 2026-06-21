@@ -44,7 +44,7 @@ The same Pi agent keeps running normal turns in the same session context until i
 - `/goal resume`: reactivate a paused goal
 - `/goal clear`: remove the goal
 - `/goal statusbar on|off`: show or hide the footer status line
-- `create_goal` tool: model can create a goal only when explicitly requested and only if no goal exists
+- `create_goal` tool: model can set or replace the current goal only when explicitly requested
 - `get_goal` tool: read current goal state
 - `update_goal` tool: model can only mark the goal `complete`
 - `get_goal` and `update_goal` are only exposed to the model while a goal is `active`; paused, cleared, complete, and budget-limited goals hide them so unrelated sessions are not tempted to call them
