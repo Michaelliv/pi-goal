@@ -27,10 +27,11 @@ test("create_goal uses upsert semantics for explicitly requested goals", () => {
 	assert.doesNotMatch(indexSource, /This thread already has a goal/);
 });
 
-test("update_goal remains completion-only in schema and guidance", () => {
+test("update_goal accepts complete or waiting, never lifecycle control", () => {
 	assert.match(indexSource, /name: "update_goal"/);
-	assert.match(indexSource, /enum: \["complete"\]/);
+	assert.match(indexSource, /enum: \["complete", "waiting"\]/);
 	assert.match(indexSource, /Do not use update_goal to pause, resume, abandon, or budget-limit a goal/);
+	assert.match(indexSource, /status=waiting/);
 });
 
 test("README documents the model-set goal and completion accounting contracts", () => {

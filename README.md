@@ -4,7 +4,7 @@
 
 Persistent autonomous goals for [pi](https://github.com/badlogic/pi-mono).
 
-`pi-goal` adds a `/goal` command and goal tools so Pi can keep working toward a long-running, thread-scoped objective until the goal is complete, paused, cleared, or token-budget-limited.
+`pi-goal` adds a `/goal` command and goal tools so Pi can keep working toward a long-running, thread-scoped objective until the goal is complete, paused, cleared, token-budget-limited, or waiting for an external event.
 
 ## Install
 
@@ -33,7 +33,7 @@ pi install git:github.com/Michaelliv/pi-goal
 
 When a goal is active, the extension shows compact visible lifecycle markers like `Goal active` and `Goal continuing`; expand them with `ctrl+o` to inspect the objective and usage. The full continuation instructions ride along as the content of that custom message, so the model always has the objective and audit guidance in the transcript while the renderer keeps the visible UI compact.
 
-The same Pi agent keeps running normal turns in the same session context until it calls `update_goal({ status: "complete" })`, the user pauses/clears it, or the token budget is reached. Reloading Pi pauses an active goal instead of silently resuming it; use `/goal resume` to continue.
+The same Pi agent keeps running normal turns in the same session context until it calls `update_goal({ status: "complete" })`, marks the goal `waiting`, or the user pauses/clears it, or the token budget is reached. Reloading Pi pauses an active goal instead of silently resuming it; use `/goal resume` to continue.
 
 ## What it adds
 
@@ -46,9 +46,9 @@ The same Pi agent keeps running normal turns in the same session context until i
 - `/goal statusbar on|off`: show or hide the footer status line
 - `create_goal` tool: model can set or replace the current goal only when explicitly requested
 - `get_goal` tool: read current goal state
-- `update_goal` tool: model can only mark the goal `complete`
-- `get_goal` and `update_goal` are only exposed to the model while a goal is `active`; paused, cleared, complete, and budget-limited goals hide them so unrelated sessions are not tempted to call them
-- footer status: `Pursuing goal`, `Goal paused`, `Goal achieved`, or `Goal unmet`
+- `update_goal` tool: model can mark the goal `complete`, or mark it `waiting` to end the turn without a scheduled continuation while passively waiting for an external event (e.g. a background task notification)
+- `get_goal` and `update_goal` are only exposed to the model while a goal is `active`; waiting, paused, cleared, complete, and budget-limited goals hide them so unrelated sessions are not tempted to call them
+- footer status: `Pursuing goal`, `Goal waiting for external event (auto-resumes)`, `Goal paused`, `Goal achieved`, or `Goal unmet`
 
 ## Flow
 
@@ -60,12 +60,13 @@ The same Pi agent keeps running normal turns in the same session context until i
   -> trigger an agent turn
   -> account time/tokens on turn_end
   -> queue another continuation on agent_end while active
+  -> `update_goal({ status: "waiting" })` suspends continuation until the next real turn (user message or event notification), which auto-resumes the goal
   -> stop when update_goal marks complete, user pauses/clears, or budget is hit
 ```
 
 ## Completion behavior
 
-The model is instructed to audit completion against real evidence before calling `update_goal`. The `update_goal` tool deliberately accepts only `status: "complete"`; pausing, resuming, clearing, and budget limiting are controlled by the user or extension runtime. The final turn is still accounted even when the model completes the goal mid-turn.
+The model is instructed to audit completion against real evidence before calling `update_goal`. The `update_goal` tool accepts only `status: "complete"` and `status: "waiting"`; pausing, resuming, clearing, and budget limiting are controlled by the user or extension runtime. `waiting` is a scheduling hint, not lifecycle control: it suppresses the agent_end continuation so the agent can end its turn and passively wait for an external wake (background task notification, user input) instead of burning API calls on no-op turns; the next real turn automatically returns the goal to `active`. The final turn is still accounted even when the model completes the goal mid-turn.
 
 ## State
 
