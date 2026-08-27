@@ -1,4 +1,4 @@
-export type GoalStatus = "active" | "paused" | "budget_limited" | "complete";
+export type GoalStatus = "active" | "waiting" | "paused" | "budget_limited" | "complete";
 
 export type GoalState = {
 	version: 1;
@@ -12,7 +12,7 @@ export type GoalState = {
 	updatedAt: number;
 };
 
-export type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+export type GoalEventKind = "active" | "continuation" | "waiting" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
 export function parseTokenBudget(input: string): { objective: string; tokenBudget: number | null; error?: string } {
 	const match = input.match(/(?:^|\s)--tokens(?:=|\s+)(\S+\s*[kKmM]?)(?:\s|$)/);
@@ -59,6 +59,7 @@ export function statusLine(state: GoalState | null): string | undefined {
 	if (!state) return undefined;
 	const budget = state.tokenBudget ? ` (${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)})` : ` (${formatElapsed(state.timeUsedSeconds)})`;
 	if (state.status === "active") return `Pursuing goal${budget}`;
+	if (state.status === "waiting") return "Goal waiting for external event (auto-resumes)";
 	if (state.status === "paused") return "Goal paused (/goal resume)";
 	if (state.status === "budget_limited") return state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned";
 	return `Goal achieved${budget}`;
@@ -78,6 +79,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 	const labels: Record<GoalEventKind, string> = {
 		active: "active",
 		continuation: "continuing",
+		waiting: "waiting",
 		paused: "paused",
 		resumed: "resumed",
 		cleared: "cleared",

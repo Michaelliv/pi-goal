@@ -35,6 +35,12 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 			return continuationPrompt(state);
 		case "budget_limited":
 			return budgetLimitPrompt(state);
+		case "waiting":
+			return `The active goal is now waiting. No continuation turn will be scheduled while it waits.
+
+Objective: ${state.objective}
+
+The goal automatically returns to active as soon as the next turn starts (a user message or an external event such as a background task notification). Until then, do not busy-wait, poll, or take further action for this goal.`;
 		case "paused":
 			return `The active goal has been paused by the user. Stop pursuing it for now and wait for further instructions.\n\nObjective: ${state.objective}`;
 		case "cleared":
@@ -144,7 +150,7 @@ Before deciding that the goal is achieved, perform a completion audit against th
 
 Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call update_goal with status \"complete\" so usage accounting is preserved.
 
-Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.`;
+Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work. If the only remaining action is to passively wait for an external event (for example, a background task terminal notification or user input), call update_goal with status \"waiting\" and then end the turn — do not reply with a no-op status message; the goal auto-resumes when the next real turn arrives.`;
 }
 
 function budgetLimitPrompt(state: GoalState): string {
@@ -269,10 +275,11 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "update_goal",
 		label: "Update Goal",
-		description: "Mark the current thread goal complete. This tool only accepts status=complete and final turn usage is accounted by the runtime.",
-		promptSnippet: "Mark the current goal complete after a strict completion audit",
+		description: "Mark the current thread goal complete, or mark it waiting to end the turn without scheduling a continuation while passively waiting for an external event. This tool only accepts status=complete or status=waiting.",
+		promptSnippet: "Mark the current goal complete after a strict completion audit, or mark it waiting before ending a turn to passively wait for an external event",
 		promptGuidelines: [
-			"Use update_goal only when the current pi-goal objective is fully achieved and verified against concrete evidence.",
+			"Use update_goal only when the current pi-goal objective is fully achieved and verified against concrete evidence (status=complete), or when the only remaining action is to passively wait for an external event such as a background task terminal notification (status=waiting).",
+			"When you mark the goal waiting, end the turn right after — do not busy-wait, poll, or sleep. The goal auto-resumes when the next real turn arrives.",
 			"Do not use update_goal to pause, resume, abandon, or budget-limit a goal.",
 		],
 		parameters: {
@@ -280,21 +287,38 @@ export default function piGoal(pi: ExtensionAPI) {
 			properties: {
 				status: {
 					type: "string",
-					enum: ["complete"],
-					description: "Only complete is accepted.",
+					enum: ["complete", "waiting"],
+					description: "complete = goal fully achieved; waiting = end turn without continuation until the next external event arrives.",
 				},
 			},
 			required: ["status"],
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (params.status !== "complete") {
-				return { content: [{ type: "text", text: "update_goal only accepts status=complete." }], isError: true };
+			if (params.status !== "complete" && params.status !== "waiting") {
+				return { content: [{ type: "text", text: "update_goal only accepts status=complete or status=waiting." }], isError: true };
 			}
 			if (!goal) {
 				return { content: [{ type: "text", text: "No goal is set." }], isError: true };
 			}
 			const now = Date.now();
+			if (params.status === "waiting") {
+				if (goal.status !== "active" && goal.status !== "waiting") {
+					return { content: [{ type: "text", text: `Goal is ${goal.status}; only an active goal can be marked waiting.` }], isError: true };
+				}
+				if (goal.status === "waiting") {
+					return { content: [{ type: "text", text: JSON.stringify({ goal }, null, 2) }], details: { goal } };
+				}
+				const waiting: GoalState = { ...goal, status: "waiting", updatedAt: now };
+				persist(pi, ctx, waiting);
+				// nextTurn: must never wake the agent — a steer/followUp delivery here
+				// would start a turn, which auto-resumes the goal and re-arms the loop.
+				emitGoalEvent(pi, "waiting", waiting, { deliverAs: "nextTurn" });
+				return {
+					content: [{ type: "text", text: JSON.stringify({ goal: waiting }, null, 2) }],
+					details: { goal: waiting },
+				};
+			}
 			const next: GoalState = { ...goal, status: "complete", updatedAt: now };
 			persist(pi, ctx, next);
 			emitGoalEvent(pi, "complete", next);
@@ -406,7 +430,13 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_start", (_event, _ctx) => {
+	pi.on("turn_start", (_event, ctx) => {
+		if (goal?.status === "waiting") {
+			// An externally triggered turn (user message or event notification) arrived:
+			// wake the goal back up so normal continuation resumes after this turn.
+			goal = { ...goal, status: "active", updatedAt: Date.now() };
+			persist(pi, ctx, goal);
+		}
 		activeTurnStartedAt = Date.now();
 		activeGoalThisTurnId = goal?.status === "active" ? goal.id : null;
 	});
