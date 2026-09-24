@@ -24,6 +24,18 @@ let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
 
+// Safety valve: an active goal re-queues a continuation on every agent_end with
+// no upper bound. If the model keeps landing on the same blocker (e.g. an
+// unanswered owner decision), that loop runs forever unattended, burning real
+// money for zero progress -- measured on a real goal: ~5 hours and ~$494 spent
+// re-asking the same already-answered-nowhere question. Track consecutive
+// *automatic* continuations (i.e. not started by a real user message, a manual
+// /goal resume, or a new/replaced goal) and auto-pause once the streak gets
+// long enough that it is almost certainly stuck rather than making progress.
+let consecutiveAutoContinuations = 0;
+let autoContinuationPending = false;
+const MAX_CONSECUTIVE_AUTO_CONTINUATIONS = 5;
+
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
 // The TUI renderer collapses long bodies down to a compact badge for humans.
@@ -104,6 +116,8 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 	goal = next;
 	if (next?.status !== "active") {
 		continuationQueued = false;
+		consecutiveAutoContinuations = 0;
+		autoContinuationPending = false;
 	}
 	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
 	updateStatusBar(ctx);
@@ -199,6 +213,7 @@ function queueContinuation(pi: ExtensionAPI, state: GoalState) {
 	queueMicrotask(() => {
 		continuationQueued = false;
 		if (!goal || goal.id !== state.id || goal.status !== "active") return;
+		autoContinuationPending = true;
 		emitGoalEvent(pi, "continuation", goal, { triggerTurn: true, deliverAs: "followUp" });
 	});
 }
@@ -436,6 +451,15 @@ export default function piGoal(pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, _ctx) => {
 		activeTurnStartedAt = Date.now();
 		activeGoalThisTurnId = goal?.status === "active" ? goal.id : null;
+		if (autoContinuationPending) {
+			consecutiveAutoContinuations += 1;
+			autoContinuationPending = false;
+		} else {
+			// Turn wasn't started by our own queued continuation (a real user
+			// message, a manual resume, or a new/replaced goal) -- the streak
+			// of unattended repeats is broken, so reset it.
+			consecutiveAutoContinuations = 0;
+		}
 	});
 
 	pi.on("turn_end", (event, ctx) => {
@@ -457,6 +481,15 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("agent_end", (_event, ctx) => {
 		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
+		if (consecutiveAutoContinuations >= MAX_CONSECUTIVE_AUTO_CONTINUATIONS) {
+			const next: GoalState = { ...goal, status: "paused", updatedAt: Date.now() };
+			persist(pi, ctx, next);
+			ctx.ui.notify(
+				`‖ Goal auto-paused after ${MAX_CONSECUTIVE_AUTO_CONTINUATIONS} consecutive automatic continuations with no new input -- it is very likely repeating the same blocked result. Give it the input it needs (e.g. "/goal <objective>, <answer>" to replace the goal with the missing decision baked in) or /goal resume to keep trying as-is.`,
+				"warning",
+			);
+			return;
+		}
 		queueContinuation(pi, goal);
 	});
 }

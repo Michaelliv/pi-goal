@@ -8,7 +8,37 @@ const indexSource = readFileSync(join(__dirname, "../.pi/extensions/pi-goal/inde
 test("persisting a non-active goal cancels any queued continuation", () => {
 	assert.match(
 		indexSource,
-		/if \(next\?\.status !== "active"\) \{\s*continuationQueued = false;\s*\}/,
+		/if \(next\?\.status !== "active"\) \{\s*continuationQueued = false;/,
+	);
+});
+
+// A goal auto-re-queues a continuation on every agent_end with no cap. If the
+// model keeps landing on the same blocker, that runs forever unattended --
+// measured on a real goal: ~5 hours and ~$494 spent re-asking an
+// already-unanswered question with zero progress. Consecutive *automatic*
+// continuations (not a real user message, a manual resume, or a replaced
+// goal) must be capped, and persisting a non-active goal must reset the
+// streak so a fresh resume/replace always gets a full budget again.
+test("consecutive automatic continuations are capped and reset on non-active persist", () => {
+	assert.match(indexSource, /const MAX_CONSECUTIVE_AUTO_CONTINUATIONS = \d+;/);
+	assert.match(
+		indexSource,
+		/if \(next\?\.status !== "active"\) \{\s*continuationQueued = false;\s*consecutiveAutoContinuations = 0;\s*autoContinuationPending = false;\s*\}/,
+	);
+	assert.match(
+		indexSource,
+		/if \(consecutiveAutoContinuations >= MAX_CONSECUTIVE_AUTO_CONTINUATIONS\) \{/,
+	);
+});
+
+// The cap only fires for continuations *we* triggered automatically -- it must
+// not fire for turns started by a real user message, a manual /goal resume,
+// or a freshly (re)created goal, or it would block legitimate work.
+test("only auto-triggered continuations count toward the streak", () => {
+	assert.match(indexSource, /autoContinuationPending = true;\s*emitGoalEvent\(pi, "continuation", goal/);
+	assert.match(
+		indexSource,
+		/if \(autoContinuationPending\) \{\s*consecutiveAutoContinuations \+= 1;\s*autoContinuationPending = false;\s*\} else \{/,
 	);
 });
 
