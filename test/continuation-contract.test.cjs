@@ -5,9 +5,9 @@ const { test } = require("node:test");
 
 const indexSource = readFileSync(join(__dirname, "../.pi/extensions/pi-goal/index.ts"), "utf8");
 
-test("persisting a non-active goal cancels any queued continuation", () => {
+test("persisting a non-active goal cancels any queued continuation and hold timer", () => {
 	assert.match(
 		indexSource,
-		/if \(next\?\.status !== "active"\) \{\s*continuationQueued = false;\s*\}/,
+		/if \(next\?\.status !== "active"\) \{\s*continuationQueued = false;\s*clearHoldRecheckTimer\(\);\s*\}/,
 	);
 });
