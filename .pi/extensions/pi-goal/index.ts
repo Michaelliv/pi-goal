@@ -14,6 +14,7 @@ import {
 	normalizeTokenBudget,
 } from "./goal-state";
 import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
+import { trackSubagentActivity, type SubagentActivity } from "./subagent-activity";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
@@ -23,6 +24,20 @@ let statusBarEnabled = true;
 let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
+
+// Background sub-agent awareness: while an async sub-agent run is in flight,
+// the session is idle-but-not-done — the real work lives in the child, and
+// each child completion wakes the session on its own. The continuation loop
+// holds in that window so it cannot ping an idle parent with no-op turns
+// while children work (see subagent-activity.ts). Assigned on extension load.
+let subagentActivity: SubagentActivity | null = null;
+
+// While holding for in-flight runs, this timer re-checks periodically so a
+// missed completion event can delay the next tick briefly but never stall a
+// goal: status verification retires finished runs, and the tracker's age
+// ceiling retires unverifiable ones.
+let holdRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+const HOLD_RECHECK_INTERVAL_MS = 60_000;
 
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
@@ -99,10 +114,44 @@ function syncGoalTools(pi: ExtensionAPI) {
 	pi.setActiveTools(Array.from(active));
 }
 
+function inFlightRuns(): boolean {
+	return subagentActivity?.hasActiveRuns() ?? false;
+}
+
+function clearHoldRecheckTimer() {
+	if (holdRecheckTimer !== null) {
+		clearTimeout(holdRecheckTimer);
+		holdRecheckTimer = null;
+	}
+}
+
+// Re-check a held loop after HOLD_RECHECK_INTERVAL_MS. Completion events are
+// the primary release signal; this timer only bounds the damage of a missed
+// event. Runs the tracker still believes are alive re-arm the hold; otherwise
+// the loop resumes exactly as a normal agent_end would.
+function armHoldRecheck(pi: ExtensionAPI, ctx: ExtensionContext) {
+	if (holdRecheckTimer !== null) return;
+	holdRecheckTimer = setTimeout(() => {
+		holdRecheckTimer = null;
+		try {
+			if (!goal || goal.status !== "active" || continuationQueued) return;
+			if (inFlightRuns()) {
+				armHoldRecheck(pi, ctx);
+				return;
+			}
+			if (ctx.hasPendingMessages() || !ctx.isIdle()) return;
+			queueContinuation(pi, goal);
+		} catch {
+			// A stale context must never crash the host process.
+		}
+	}, HOLD_RECHECK_INTERVAL_MS);
+}
+
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
 	goal = next;
 	if (next?.status !== "active") {
 		continuationQueued = false;
+		clearHoldRecheckTimer();
 	}
 	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
 	updateStatusBar(ctx);
@@ -177,6 +226,8 @@ function queueContinuation(pi: ExtensionAPI, state: GoalState) {
 }
 
 export default function piGoal(pi: ExtensionAPI) {
+	subagentActivity = trackSubagentActivity(pi.events);
+
 	pi.registerMessageRenderer(EVENT_TYPE, (message, { expanded }, theme) => {
 		const details = message.details as { kind?: GoalEventKind; goal?: GoalState | null; timestamp?: number } | undefined;
 		const kind = details?.kind ?? "continuation";
@@ -350,7 +401,12 @@ export default function piGoal(pi: ExtensionAPI) {
 				const next = { ...goal, status, updatedAt: now };
 				persist(pi, ctx, next);
 				emitGoalEvent(pi, status === "active" ? "resumed" : "paused", next);
-				if (status === "active" && ctx.isIdle()) queueContinuation(pi, next);
+				if (status === "active" && ctx.isIdle()) {
+					// Resuming while background runs are in flight must not tick an
+					// idle parent; the completion wakes re-drive the loop instead.
+					if (inFlightRuns()) armHoldRecheck(pi, ctx);
+					else queueContinuation(pi, next);
+				}
 				return;
 			}
 
@@ -378,6 +434,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
+		subagentActivity?.forget();
+		clearHoldRecheckTimer();
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
 		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
@@ -430,6 +488,12 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("agent_end", (_event, ctx) => {
 		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
+		if (inFlightRuns()) {
+			// Idle-but-not-done: children own the work in flight, and their
+			// completion wakes re-drive the loop. Hold instead of ticking.
+			armHoldRecheck(pi, ctx);
+			return;
+		}
 		queueContinuation(pi, goal);
 	});
 }

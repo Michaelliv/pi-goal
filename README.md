@@ -67,6 +67,12 @@ The same Pi agent keeps running normal turns in the same session context until i
 
 The model is instructed to audit completion against real evidence before calling `update_goal`. The `update_goal` tool deliberately accepts only `status: "complete"`; pausing, resuming, clearing, and budget limiting are controlled by the user or extension runtime. The final turn is still accounted even when the model completes the goal mid-turn.
 
+## Background sub-agents
+
+When the [pi-subagents](https://github.com/JordiPosthumus/pi-subagents) package (or a compatible build) launches background runs, the goal loop holds while any background run started by this session is in flight: each child completion wakes the session on its own, and the next continuation tick happens only after the last run drains. This prevents the loop from pinging an idle parent with no-op turns while children do the real work.
+
+Completion events are the release signal, with safety nets so a missed event can delay the loop briefly but never stall the goal: tracked runs are verified against their `status.json` (a finished run retires immediately), unverifiable entries expire after 24 hours, and a held loop re-checks every 60 seconds.
+
 ## State
 
 Goal state is stored as Pi custom session entries with `customType: "pi-goal"`. It follows the active session branch, survives reloads, and does not require an external database.
