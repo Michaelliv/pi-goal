@@ -18,12 +18,6 @@ import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
 
-let goal: GoalState | null = null;
-let statusBarEnabled = true;
-let activeTurnStartedAt: number | null = null;
-let activeGoalThisTurnId: string | null = null;
-let continuationQueued = false;
-
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
 // The TUI renderer collapses long bodies down to a compact badge for humans.
@@ -83,36 +77,7 @@ function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null
 	return { goal: null, statusBarEnabled: true };
 }
 
-function updateStatusBar(ctx: ExtensionContext) {
-	ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
-}
-
 const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
-
-// Expose read/update tools to the LLM only while a goal is actively being pursued.
-// Keep create_goal available so the model can set or replace a goal when explicitly asked.
-function syncGoalTools(pi: ExtensionAPI) {
-	const wantActiveTools = goal?.status === "active";
-	const active = new Set(pi.getActiveTools());
-	active.add("create_goal");
-	for (const name of ACTIVE_GOAL_TOOL_NAMES) (wantActiveTools ? active.add(name) : active.delete(name));
-	pi.setActiveTools(Array.from(active));
-}
-
-function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
-	goal = next;
-	if (next?.status !== "active") {
-		continuationQueued = false;
-	}
-	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
-	updateStatusBar(ctx);
-	syncGoalTools(pi);
-}
-
-function persistSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
-	pi.appendEntry(CUSTOM_TYPE, { goal, statusBarEnabled });
-	updateStatusBar(ctx);
-}
 
 function continuationPrompt(state: GoalState): string {
 	const tokenBudget = state.tokenBudget == null ? "none" : String(state.tokenBudget);
@@ -166,17 +131,51 @@ The system has marked the goal as budget_limited, so do not start new substantiv
 Do not call update_goal unless the goal is actually complete.`;
 }
 
-function queueContinuation(pi: ExtensionAPI, state: GoalState) {
-	if (continuationQueued || state.status !== "active") return;
-	continuationQueued = true;
-	queueMicrotask(() => {
-		continuationQueued = false;
-		if (!goal || goal.id !== state.id || goal.status !== "active") return;
-		emitGoalEvent(pi, "continuation", goal, { triggerTurn: true, deliverAs: "followUp" });
-	});
-}
-
 export default function piGoal(pi: ExtensionAPI) {
+	let goal: GoalState | null = null;
+	let statusBarEnabled = true;
+	let activeTurnStartedAt: number | null = null;
+	let activeGoalThisTurnId: string | null = null;
+	let continuationQueued = false;
+
+	function updateStatusBar(ctx: ExtensionContext) {
+		ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
+	}
+
+	// Expose read/update tools only for an active goal in this extension instance.
+	function syncGoalTools() {
+		const wantActiveTools = goal?.status === "active";
+		const active = new Set(pi.getActiveTools());
+		active.add("create_goal");
+		for (const name of ACTIVE_GOAL_TOOL_NAMES) (wantActiveTools ? active.add(name) : active.delete(name));
+		pi.setActiveTools(Array.from(active));
+	}
+
+	function persist(ctx: ExtensionContext, next: GoalState | null) {
+		goal = next;
+		if (next?.status !== "active") {
+			continuationQueued = false;
+		}
+		pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
+		updateStatusBar(ctx);
+		syncGoalTools();
+	}
+
+	function persistSettings(ctx: ExtensionContext) {
+		pi.appendEntry(CUSTOM_TYPE, { goal, statusBarEnabled });
+		updateStatusBar(ctx);
+	}
+
+	function queueContinuation(state: GoalState) {
+		if (continuationQueued || state.status !== "active") return;
+		continuationQueued = true;
+		queueMicrotask(() => {
+			continuationQueued = false;
+			if (!goal || goal.id !== state.id || goal.status !== "active") return;
+			emitGoalEvent(pi, "continuation", goal, { triggerTurn: true, deliverAs: "followUp" });
+		});
+	}
+
 	pi.registerMessageRenderer(EVENT_TYPE, (message, { expanded }, theme) => {
 		const details = message.details as { kind?: GoalEventKind; goal?: GoalState | null; timestamp?: number } | undefined;
 		const kind = details?.kind ?? "continuation";
@@ -257,7 +256,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: parsedBudget.error }], isError: true };
 			}
 			const next = createGoalState(objective, parsedBudget.tokenBudget);
-			persist(pi, ctx, next);
+			persist(ctx, next);
 			emitGoalEvent(pi, "active", next, { triggerTurn: ctx.isIdle() });
 			return {
 				content: [{ type: "text", text: JSON.stringify({ goal: next, remainingTokens: next.tokenBudget }, null, 2) }],
@@ -296,7 +295,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			}
 			const now = Date.now();
 			const next: GoalState = { ...goal, status: "complete", updatedAt: now };
-			persist(pi, ctx, next);
+			persist(ctx, next);
 			emitGoalEvent(pi, "complete", next);
 			return {
 				content: [{ type: "text", text: JSON.stringify({ goal: next, remainingTokens: next.tokenBudget == null ? null : Math.max(0, next.tokenBudget - next.tokensUsed) }, null, 2) }],
@@ -325,7 +324,7 @@ export default function piGoal(pi: ExtensionAPI) {
 			if (trimmed === "statusbar" || trimmed === "statusbar toggle" || trimmed === "statusbar on" || trimmed === "statusbar off") {
 				const [, value] = trimmed.split(/\s+/, 2);
 				statusBarEnabled = value === "on" ? true : value === "off" ? false : !statusBarEnabled;
-				persistSettings(pi, ctx);
+				persistSettings(ctx);
 				ctx.ui.notify(`Goal status bar ${statusBarEnabled ? "enabled" : "disabled"}.`, "info");
 				return;
 			}
@@ -336,7 +335,7 @@ export default function piGoal(pi: ExtensionAPI) {
 					return;
 				}
 				const previous = goal;
-				persist(pi, ctx, null);
+				persist(ctx, null);
 				emitGoalEvent(pi, "cleared", previous);
 				return;
 			}
@@ -348,9 +347,9 @@ export default function piGoal(pi: ExtensionAPI) {
 				}
 				const status: GoalStatus = trimmed === "pause" ? "paused" : "active";
 				const next = { ...goal, status, updatedAt: now };
-				persist(pi, ctx, next);
+				persist(ctx, next);
 				emitGoalEvent(pi, status === "active" ? "resumed" : "paused", next);
-				if (status === "active" && ctx.isIdle()) queueContinuation(pi, next);
+				if (status === "active" && ctx.isIdle()) queueContinuation(next);
 				return;
 			}
 
@@ -368,7 +367,7 @@ export default function piGoal(pi: ExtensionAPI) {
 				if (!ok) return;
 			}
 			const next = createGoalState(parsed.objective, parsed.tokenBudget, now);
-			persist(pi, ctx, next);
+			persist(ctx, next);
 			emitGoalEvent(pi, "active", next, { triggerTurn: ctx.isIdle() });
 		},
 	});
@@ -381,13 +380,13 @@ export default function piGoal(pi: ExtensionAPI) {
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
 		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
-		syncGoalTools(pi);
+		syncGoalTools();
 		if (goal?.status === "active" && event.reason === "reload") {
 			// Reload pauses an active goal so it does not silently resume.
 			// We do not emit a goal event — the LLM has nothing to do here —
 			// just persist the new status and tell the human.
 			goal = { ...goal, status: "paused", updatedAt: Date.now() };
-			persist(pi, ctx, goal);
+			persist(ctx, goal);
 			ctx.ui.notify(
 				`‖ Goal paused after reload: ${truncateObjective(goal.objective)}\nUse /goal resume to continue, or /goal clear to stop.`,
 				"info",
@@ -422,7 +421,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		activeGoalThisTurnId = null;
 		const tokenDelta = tokenDeltaFromUsage((event.message as { usage?: UsageSnapshot } | undefined)?.usage);
 		const next = accountGoalTurn(goal, tokenDelta, elapsed);
-		persist(pi, ctx, next);
+		persist(ctx, next);
 		if (next.status === "budget_limited") {
 			emitGoalEvent(pi, "budget_limited", next, { triggerTurn: true, deliverAs: "followUp" });
 		}
@@ -430,6 +429,6 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("agent_end", (_event, ctx) => {
 		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
-		queueContinuation(pi, goal);
+		queueContinuation(goal);
 	});
 }
