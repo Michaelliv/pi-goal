@@ -14,7 +14,31 @@ const {
 	parseTokenBudget,
 	statusLine,
 	truncateObjective,
+	turnMadeProgress,
+	GOAL_TOOL_NAMES,
 } = jiti("../.pi/extensions/pi-goal/goal-state.ts");
+
+const asstWith = (...blocks) => [{ role: "assistant", content: blocks }];
+
+test("turnMadeProgress: true when a non-goal tool was called", () => {
+	assert.equal(turnMadeProgress(asstWith({ type: "toolCall", name: "bash" })), true);
+	assert.equal(turnMadeProgress(asstWith({ type: "text", text: "ok" }, { type: "toolCall", name: "edit" })), true);
+});
+
+test("turnMadeProgress: false for text-only or goal-tool-only loops (the runaway signature)", () => {
+	assert.equal(turnMadeProgress(asstWith({ type: "text", text: "still blocked, no change" })), false);
+	for (const name of GOAL_TOOL_NAMES) {
+		assert.equal(turnMadeProgress(asstWith({ type: "toolCall", name })), false);
+	}
+	assert.equal(turnMadeProgress([]), false);
+});
+
+test("turnMadeProgress: fails open on unknown/malformed shapes", () => {
+	assert.equal(turnMadeProgress(undefined), true);
+	assert.equal(turnMadeProgress(null), true);
+	assert.equal(turnMadeProgress("nope"), true);
+	assert.equal(turnMadeProgress([{ role: "assistant" }]), false); // no content array → no progress found
+});
 
 test("parseTokenBudget returns trimmed objective with no budget", () => {
 	assert.deepEqual(parseTokenBudget("  finish the migration  "), {

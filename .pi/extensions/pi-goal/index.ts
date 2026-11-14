@@ -8,6 +8,7 @@ import {
 	parseTokenBudget,
 	statusLine,
 	truncateObjective,
+	turnMadeProgress,
 	type GoalEventKind,
 	type GoalState,
 	type GoalStatus,
@@ -23,6 +24,11 @@ let statusBarEnabled = true;
 let activeTurnStartedAt: number | null = null;
 let activeGoalThisTurnId: string | null = null;
 let continuationQueued = false;
+// Runaway brake: consecutive continuation loops that did no real work (no tool use beyond the
+// goal-management tools). Auto-pause once it hits the limit so a stuck goal stops re-feeding its
+// objective and burning tokens instead of looping forever.
+let stallStreak = 0;
+const STALL_LIMIT = Math.max(1, Math.floor(Number(process.env.PI_GOAL_STALL_LIMIT)) || 3);
 
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
@@ -100,6 +106,12 @@ function syncGoalTools(pi: ExtensionAPI) {
 }
 
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
+	// Reset the stall streak whenever the goal changes or leaves the active loop, so a new or
+	// resumed goal never inherits a prior goal's stall count. A continuing active goal (same id,
+	// still active — the per-turn accounting persist) keeps its streak.
+	if (next?.id !== goal?.id || next?.status !== "active") {
+		stallStreak = 0;
+	}
 	goal = next;
 	if (next?.status !== "active") {
 		continuationQueued = false;
@@ -378,6 +390,7 @@ export default function piGoal(pi: ExtensionAPI) {
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
+		stallStreak = 0;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
 		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
@@ -428,8 +441,27 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", (_event, ctx) => {
+	pi.on("agent_end", (event, ctx) => {
 		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
-		queueContinuation(pi, goal);
+		if (turnMadeProgress((event as { messages?: unknown }).messages)) {
+			stallStreak = 0;
+			queueContinuation(pi, goal);
+			return;
+		}
+		stallStreak += 1;
+		if (stallStreak < STALL_LIMIT) {
+			queueContinuation(pi, goal);
+			return;
+		}
+		// Stalled: pause instead of re-feeding. persist() to paused resets the streak and stops
+		// continuation; the human resumes or clears. No goal event — feeding the LLM another prompt
+		// is exactly the burn we are stopping.
+		const streak = stallStreak;
+		const paused: GoalState = { ...goal, status: "paused", updatedAt: Date.now() };
+		persist(pi, ctx, paused);
+		ctx.ui.notify(
+			`‖ Goal auto-paused after ${streak} continuation turns with no tool use.\nThe loop was re-feeding the objective without acting. Use /goal resume to continue, or /goal clear to stop.\nObjective: ${truncateObjective(paused.objective)}`,
+			"warning",
+		);
 	});
 }

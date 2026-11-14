@@ -101,6 +101,29 @@ export function createGoalState(objective: string, tokenBudget: number | null, n
 	};
 }
 
+// Goal-management tool calls are not progress: a runaway can spam get_goal/create_goal/update_goal
+// without doing real work. Only non-goal tool calls (edit/bash/write/read/...) count.
+export const GOAL_TOOL_NAMES: ReadonlySet<string> = new Set(["get_goal", "create_goal", "update_goal"]);
+
+// A continuation agent loop "made progress" if it called any tool other than the goal-management
+// tools. The runaway failure mode is the model narrating text (or only re-reading the goal) turn
+// after turn while the continuation prompt re-fires, burning tokens without acting.
+// Unknown message shapes fail open (return true) so a legitimate goal is never falsely paused.
+export function turnMadeProgress(messages: unknown, goalToolNames: ReadonlySet<string> = GOAL_TOOL_NAMES): boolean {
+	if (!Array.isArray(messages)) return true;
+	for (const message of messages) {
+		const content = (message as { content?: unknown })?.content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			const b = block as { type?: unknown; name?: unknown };
+			if (b?.type === "toolCall" && typeof b.name === "string" && !goalToolNames.has(b.name)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 export function accountGoalTurn(state: GoalState, tokenDelta: number, elapsedSeconds: number, now = Date.now()): GoalState {
 	let next: GoalState = {
 		...state,
