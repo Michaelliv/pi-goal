@@ -33,6 +33,13 @@ test("turnMadeProgress: false for text-only or goal-tool-only loops (the runaway
 	assert.equal(turnMadeProgress([]), false);
 });
 
+test("turnMadeProgress: thinking-only turn is not progress", () => {
+	// ThinkingContent blocks must not be mistaken for tool calls
+	assert.equal(turnMadeProgress(asstWith({ type: "thinking", thinking: "I will plan..." })), false);
+	// Thinking + goal-tool-only is still no progress
+	assert.equal(turnMadeProgress(asstWith({ type: "thinking", thinking: "ok" }, { type: "toolCall", name: "get_goal" })), false);
+});
+
 test("turnMadeProgress: fails open on unknown/malformed shapes", () => {
 	assert.equal(turnMadeProgress(undefined), true);
 	assert.equal(turnMadeProgress(null), true);
