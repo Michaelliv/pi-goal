@@ -35,8 +35,8 @@ test("update_goal remains completion-only in schema and guidance", () => {
 
 test("agent_end has a no-progress runaway brake that auto-pauses", () => {
 	assert.match(indexSource, /turnMadeProgress\(\(event as \{ messages\?: unknown \}\)\.messages\)/);
-	assert.match(indexSource, /stallStreak \+= 1/);
-	assert.match(indexSource, /stallStreak >= STALL_LIMIT|stallStreak < STALL_LIMIT/);
+	// stallStreakStep is the extracted pure function; the raw increment no longer appears inline
+	assert.match(indexSource, /stallStreakStep\(stallStreak, madeProgress, STALL_LIMIT\)/);
 	assert.match(indexSource, /PI_GOAL_STALL_LIMIT/);
 	assert.match(indexSource, /status: "paused"/);
 });

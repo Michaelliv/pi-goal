@@ -108,7 +108,9 @@ export const GOAL_TOOL_NAMES: ReadonlySet<string> = new Set(["get_goal", "create
 // A continuation agent loop "made progress" if it called any tool other than the goal-management
 // tools. The runaway failure mode is the model narrating text (or only re-reading the goal) turn
 // after turn while the continuation prompt re-fires, burning tokens without acting.
-// Unknown message shapes fail open (return true) so a legitimate goal is never falsely paused.
+// Top-level non-array input fails open (return true) so a legitimate goal is never falsely paused.
+// A malformed per-message shape contributes no progress (fail-closed) — the SDK guarantees
+// content is an array on assistant messages, so the degenerate case does not occur in the field.
 export function turnMadeProgress(messages: unknown, goalToolNames: ReadonlySet<string> = GOAL_TOOL_NAMES): boolean {
 	if (!Array.isArray(messages)) return true;
 	for (const message of messages) {
@@ -122,6 +124,21 @@ export function turnMadeProgress(messages: unknown, goalToolNames: ReadonlySet<s
 		}
 	}
 	return false;
+}
+
+export type StallAction = "continue" | "pause";
+
+// Pure state machine for the stall-brake counter. Returns the next streak value and whether
+// to pause. Extracted so the full breaker logic (increment, threshold comparison, reset) is
+// unit-tested independent of the agent_end wiring.
+export function stallStreakStep(
+	streak: number,
+	madeProgress: boolean,
+	limit: number,
+): { next: number; action: StallAction } {
+	if (madeProgress) return { next: 0, action: "continue" };
+	const next = streak + 1;
+	return { next, action: next >= limit ? "pause" : "continue" };
 }
 
 export function accountGoalTurn(state: GoalState, tokenDelta: number, elapsedSeconds: number, now = Date.now()): GoalState {

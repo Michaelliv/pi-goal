@@ -443,24 +443,20 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("agent_end", (event, ctx) => {
 		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
-		if (turnMadeProgress((event as { messages?: unknown }).messages)) {
-			stallStreak = 0;
+		const madeProgress = turnMadeProgress((event as { messages?: unknown }).messages);
+		const { next, action } = stallStreakStep(stallStreak, madeProgress, STALL_LIMIT);
+		stallStreak = next;
+		if (action === "continue") {
 			queueContinuation(pi, goal);
 			return;
 		}
-		stallStreak += 1;
-		if (stallStreak < STALL_LIMIT) {
-			queueContinuation(pi, goal);
-			return;
-		}
-		// Stalled: pause instead of re-feeding. persist() to paused resets the streak and stops
+		// action === "pause": stop re-feeding. persist() to paused resets the streak and stops
 		// continuation; the human resumes or clears. No goal event — feeding the LLM another prompt
 		// is exactly the burn we are stopping.
-		const streak = stallStreak;
 		const paused: GoalState = { ...goal, status: "paused", updatedAt: Date.now() };
 		persist(pi, ctx, paused);
 		ctx.ui.notify(
-			`‖ Goal auto-paused after ${streak} continuation turns with no tool use.\nThe loop was re-feeding the objective without acting. Use /goal resume to continue, or /goal clear to stop.\nObjective: ${truncateObjective(paused.objective)}`,
+			`‖ Goal auto-paused after ${next} continuation turns with no tool use.\nThe loop was re-feeding the objective without acting. Use /goal resume to continue, or /goal clear to stop.\nObjective: ${truncateObjective(paused.objective)}`,
 			"warning",
 		);
 	});

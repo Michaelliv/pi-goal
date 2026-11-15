@@ -15,6 +15,7 @@ const {
 	statusLine,
 	truncateObjective,
 	turnMadeProgress,
+	stallStreakStep,
 	GOAL_TOOL_NAMES,
 } = jiti("../.pi/extensions/pi-goal/goal-state.ts");
 
@@ -45,6 +46,25 @@ test("turnMadeProgress: fails open on unknown/malformed shapes", () => {
 	assert.equal(turnMadeProgress(null), true);
 	assert.equal(turnMadeProgress("nope"), true);
 	assert.equal(turnMadeProgress([{ role: "assistant" }]), false); // no content array → no progress found
+});
+
+test("stallStreakStep: progress resets streak and returns continue", () => {
+	assert.deepEqual(stallStreakStep(0, true, 3), { next: 0, action: "continue" });
+	assert.deepEqual(stallStreakStep(2, true, 3), { next: 0, action: "continue" }); // reset mid-streak
+});
+
+test("stallStreakStep: no-progress increments and continues below limit", () => {
+	assert.deepEqual(stallStreakStep(0, false, 3), { next: 1, action: "continue" });
+	assert.deepEqual(stallStreakStep(1, false, 3), { next: 2, action: "continue" });
+});
+
+test("stallStreakStep: no-progress at limit triggers pause", () => {
+	assert.deepEqual(stallStreakStep(2, false, 3), { next: 3, action: "pause" }); // next === limit
+	assert.deepEqual(stallStreakStep(5, false, 3), { next: 6, action: "pause" }); // already past limit
+});
+
+test("stallStreakStep: limit=1 pauses on the very first no-progress turn", () => {
+	assert.deepEqual(stallStreakStep(0, false, 1), { next: 1, action: "pause" });
 });
 
 test("parseTokenBudget returns trimmed objective with no budget", () => {
