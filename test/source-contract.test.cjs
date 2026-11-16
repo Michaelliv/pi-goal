@@ -33,6 +33,14 @@ test("update_goal remains completion-only in schema and guidance", () => {
 	assert.match(indexSource, /Do not use update_goal to pause, resume, abandon, or budget-limit a goal/);
 });
 
+test("agent_end has a no-progress runaway brake that auto-pauses", () => {
+	assert.match(indexSource, /turnMadeProgress\(\(event as \{ messages\?: unknown \}\)\.messages\)/);
+	// stallStreakStep is the extracted pure function; the raw increment no longer appears inline
+	assert.match(indexSource, /stallStreakStep\(stallStreak, madeProgress, STALL_LIMIT\)/);
+	assert.match(indexSource, /PI_GOAL_STALL_LIMIT/);
+	assert.match(indexSource, /status: "paused"/);
+});
+
 test("README documents the model-set goal and completion accounting contracts", () => {
 	assert.match(readme, /`create_goal` tool: model can set or replace the current goal only when explicitly requested/);
 	assert.match(readme, /The final turn is still accounted even when the model completes the goal mid-turn/);
