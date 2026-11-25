@@ -4,7 +4,10 @@ const { createJiti } = require("jiti");
 
 const jiti = createJiti(__filename);
 const {
+	CONTINUATION_BACKOFF_BASE_MS,
+	CONTINUATION_BACKOFF_MAX_MS,
 	accountGoalTurn,
+	continuationDelayMs,
 	createGoalState,
 	formatElapsed,
 	formatTokens,
@@ -20,6 +23,24 @@ const {
 } = jiti("../.pi/extensions/pi-goal/goal-state.ts");
 
 const asstWith = (...blocks) => [{ role: "assistant", content: blocks }];
+
+test("statusLine reports a parked goal as waiting, recoverable by input", () => {
+	assert.equal(
+		statusLine({ status: "waiting", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 10 }),
+		"Goal waiting for input (/goal resume)",
+	);
+});
+
+test("continuationDelayMs is zero while the loop makes progress and backs off when stalled", () => {
+	assert.equal(continuationDelayMs(0), 0);
+	assert.equal(continuationDelayMs(1), CONTINUATION_BACKOFF_BASE_MS);
+	assert.equal(continuationDelayMs(2), CONTINUATION_BACKOFF_BASE_MS * 2);
+	assert.equal(continuationDelayMs(99), CONTINUATION_BACKOFF_MAX_MS);
+});
+
+test("goal_wait is not progress, so a park-only turn feeds the stall brake", () => {
+	assert.equal(turnMadeProgress(asstWith({ type: "toolCall", name: "goal_wait" })), false);
+});
 
 test("turnMadeProgress: true when a non-goal tool was called", () => {
 	assert.equal(turnMadeProgress(asstWith({ type: "toolCall", name: "bash" })), true);

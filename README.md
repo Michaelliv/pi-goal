@@ -47,8 +47,9 @@ The same Pi agent keeps running normal turns in the same session context until i
 - `create_goal` tool: model can set or replace the current goal only when explicitly requested
 - `get_goal` tool: read current goal state
 - `update_goal` tool: model can only mark the goal `complete`
-- `get_goal` and `update_goal` are only exposed to the model while a goal is `active`; paused, cleared, complete, and budget-limited goals hide them so unrelated sessions are not tempted to call them
-- footer status: `Pursuing goal`, `Goal paused`, `Goal achieved`, or `Goal unmet`
+- `goal_wait` tool: model parks the goal while it waits on work outside the session
+- `get_goal`, `update_goal` and `goal_wait` are only exposed to the model while a goal is `active`; waiting, paused, cleared, complete, and budget-limited goals hide them so unrelated sessions are not tempted to call them
+- footer status: `Pursuing goal`, `Goal waiting for input`, `Goal paused`, `Goal achieved`, or `Goal unmet`
 
 ## Flow
 
@@ -62,6 +63,16 @@ The same Pi agent keeps running normal turns in the same session context until i
   -> queue another continuation on agent_end while active
   -> stop when update_goal marks complete, user pauses/clears, or budget is hit
 ```
+
+## Loop guard rails
+
+A continuation turn is a turn the extension starts itself. An unbounded loop spends a full context read per turn while it waits on work it cannot advance, so the loop is bounded three ways:
+
+- **No progress.** A turn that called no tool outside the goal-management tools made no progress. The next continuation waits 5 s, then 10 s. After `PI_GOAL_STALL_LIMIT` such turns in a row (default 3) the goal parks.
+- **No external input.** After `PI_GOAL_RUN_LIMIT` self-started turns in a row (default 40), whatever they contained, the goal parks. This is the only bound on a loop that takes one cheap status tool call per turn, which the progress test counts as work.
+- **Model parks on purpose.** `goal_wait` records why. A goal that waits on a dispatched job or a background run should call it instead of polling status.
+
+A parked goal is `waiting`, not `paused`. It starts no turn by itself. The next turn the loop did not start resumes it, and that resume keys on the framework turn, so no other extension has to be installed. `/goal resume` also works. `paused` stays a human action.
 
 ## Completion behavior
 

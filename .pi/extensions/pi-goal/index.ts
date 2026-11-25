@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Box, Spacer, Text } from "@mariozechner/pi-tui";
 import {
+	CONTINUATION_RUN_LIMIT_DEFAULT,
 	accountGoalTurn,
+	continuationDelayMs,
 	createGoalState,
 	goalEventStatus,
 	goalUsage,
@@ -29,6 +31,18 @@ let continuationQueued = false;
 // objective and burning tokens instead of looping forever.
 let stallStreak = 0;
 const STALL_LIMIT = Math.max(1, Math.floor(Number(process.env.PI_GOAL_STALL_LIMIT)) || 3);
+// Bound on self-started turns in a row, whatever they contain. The stall brake only sees turns
+// that made no progress; a loop that takes one cheap status tool call per turn resets that brake
+// and would otherwise run unbounded. Reset by any turn the loop did not start.
+let runStreak = 0;
+const RUN_LIMIT = Math.max(
+	1,
+	Math.floor(Number(process.env.PI_GOAL_RUN_LIMIT)) || CONTINUATION_RUN_LIMIT_DEFAULT,
+);
+let continuationTimer: ReturnType<typeof setTimeout> | null = null;
+// Set when the extension starts its own turn, consumed by the next turn_start.
+let continuationTurnPending = false;
+let turnIsContinuation = false;
 
 // The `content` field is what the LLM sees in the conversation history.
 // Every goal event MUST carry actionable text — never a cryptic marker.
@@ -41,6 +55,8 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 			return continuationPrompt(state);
 		case "budget_limited":
 			return budgetLimitPrompt(state);
+		case "waiting":
+			return `The goal is parked and starts no turn by itself. It resumes on the next external message, or on /goal resume. Do not treat the park as a failure.\n\nObjective: ${state.objective}`;
 		case "paused":
 			return `The active goal has been paused by the user. Stop pursuing it for now and wait for further instructions.\n\nObjective: ${state.objective}`;
 		case "cleared":
@@ -93,7 +109,7 @@ function updateStatusBar(ctx: ExtensionContext) {
 	ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
 }
 
-const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
+const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal", "goal_wait"];
 
 // Expose read/update tools to the LLM only while a goal is actively being pursued.
 // Keep create_goal available so the model can set or replace a goal when explicitly asked.
@@ -111,10 +127,13 @@ function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null
 	// still active — the per-turn accounting persist) keeps its streak.
 	if (next?.id !== goal?.id || next?.status !== "active") {
 		stallStreak = 0;
+		runStreak = 0;
 	}
 	goal = next;
 	if (next?.status !== "active") {
 		continuationQueued = false;
+		continuationTurnPending = false;
+		clearContinuationTimer();
 	}
 	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
 	updateStatusBar(ctx);
@@ -156,7 +175,9 @@ Before deciding that the goal is achieved, perform a completion audit against th
 
 Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only mark the goal achieved when the audit shows that the objective has actually been achieved and no required work remains. If any requirement is missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call update_goal with status \"complete\" so usage accounting is preserved.
 
-Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.`;
+Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
+
+If the only pending work is outside this session (a dispatched job, a background run, another person's decision), call goal_wait with the reason. A parked goal starts no new turns until external input arrives. Do not take a turn just to re-check status.`;
 }
 
 function budgetLimitPrompt(state: GoalState): string {
@@ -178,14 +199,46 @@ The system has marked the goal as budget_limited, so do not start new substantiv
 Do not call update_goal unless the goal is actually complete.`;
 }
 
+function clearContinuationTimer() {
+	if (!continuationTimer) return;
+	clearTimeout(continuationTimer);
+	continuationTimer = null;
+}
+
 function queueContinuation(pi: ExtensionAPI, state: GoalState) {
-	if (continuationQueued || state.status !== "active") return;
+	if (continuationQueued || continuationTimer || state.status !== "active") return;
 	continuationQueued = true;
-	queueMicrotask(() => {
+	const fire = () => {
 		continuationQueued = false;
+		continuationTimer = null;
 		if (!goal || goal.id !== state.id || goal.status !== "active") return;
+		continuationTurnPending = true;
 		emitGoalEvent(pi, "continuation", goal, { triggerTurn: true, deliverAs: "followUp" });
-	});
+	};
+	// A loop that stopped making progress backs off instead of spinning.
+	const delay = continuationDelayMs(stallStreak);
+	if (delay <= 0) queueMicrotask(fire);
+	else continuationTimer = setTimeout(fire, delay);
+}
+
+/**
+ * Park the goal. `waiting` is not `paused`: it starts no turn by itself, and the next external
+ * turn resumes it without a human. That is what lets a goal wait on work outside this session.
+ */
+function parkGoal(pi: ExtensionAPI, ctx: ExtensionContext, reason: "stall" | "run") {
+	if (!goal || goal.status !== "active") return;
+	const next: GoalState = { ...goal, status: "waiting", waitReason: reason, updatedAt: Date.now() };
+	const detail =
+		reason === "stall"
+			? `${stallStreak} self-started turns made no progress`
+			: `${runStreak} self-started turns without external input`;
+	persist(pi, ctx, next);
+	// Record the park in the transcript so the model sees why its loop ended.
+	emitGoalEvent(pi, "waiting", next);
+	ctx.ui.notify(
+		`‖ Goal waiting for input: ${detail}.\nIt resumes on the next message, or /goal resume.\nObjective: ${truncateObjective(next.objective)}`,
+		"warning",
+	);
 }
 
 export default function piGoal(pi: ExtensionAPI) {
@@ -317,6 +370,53 @@ export default function piGoal(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "goal_wait",
+		label: "Wait On Goal",
+		description:
+			"Park the active goal while it waits on work outside this session: a dispatched job, a background run, or another person's decision. A parked goal starts no new turns by itself, and the next external turn resumes it. Use this instead of taking a turn to re-check status.",
+		promptSnippet: "Park the goal when only an external actor can unblock it",
+		promptGuidelines: [
+			"Call goal_wait when the only pending work is outside this session. Do not keep taking a turn just to re-check status.",
+			"Never park a goal that still has a concrete action you can take yourself.",
+		],
+		parameters: {
+			type: "object",
+			properties: {
+				reason: { type: "string", description: "What the goal is waiting for." },
+			},
+			additionalProperties: false,
+		} as any,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!goal || goal.status !== "active") {
+				return { content: [{ type: "text", text: "No active goal to park." }], isError: true };
+			}
+			const reason =
+				typeof params?.reason === "string" && params.reason.trim() ? params.reason.trim() : "external work";
+			const next: GoalState = {
+				...goal,
+				status: "waiting",
+				waitReason: "model",
+				updatedAt: Date.now(),
+			};
+			persist(pi, ctx, next);
+			ctx.ui.notify(`Goal waiting: ${reason}. The next message resumes it.`, "info");
+			return {
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify(
+							{ goal: next, parked: true, resumesOn: "the next external turn" },
+							null,
+							2,
+						),
+					},
+				],
+				details: { goal: next },
+			};
+		},
+	});
+
 	pi.registerCommand("goal", {
 		description: "Set, view, pause, resume, clear, or configure a long-running goal",
 		getArgumentCompletions: (prefix) => {
@@ -362,6 +462,10 @@ export default function piGoal(pi: ExtensionAPI) {
 				const next = { ...goal, status, updatedAt: now };
 				persist(pi, ctx, next);
 				emitGoalEvent(pi, status === "active" ? "resumed" : "paused", next);
+				if (status === "active") {
+					stallStreak = 0;
+					runStreak = 0;
+				}
 				if (status === "active" && ctx.isIdle()) queueContinuation(pi, next);
 				return;
 			}
@@ -390,7 +494,11 @@ export default function piGoal(pi: ExtensionAPI) {
 		goal = restored.goal;
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
+		continuationTurnPending = false;
+		turnIsContinuation = false;
+		clearContinuationTimer();
 		stallStreak = 0;
+		runStreak = 0;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
 		// Keep create_goal available, and hide read/update tools unless there is an active goal to pursue.
@@ -419,7 +527,23 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_start", (_event, _ctx) => {
+	pi.on("turn_start", (_event, ctx) => {
+		turnIsContinuation = continuationTurnPending;
+		continuationTurnPending = false;
+		if (!turnIsContinuation) {
+			// A turn this loop did not start. A parked goal resumes here: it was waiting on
+			// something outside the session, and external input is the signal that it arrived.
+			// This keys on the framework turn, not on any one tool's message shape, so the
+			// extension needs no background-subagent package installed to park and resume.
+			clearContinuationTimer();
+			runStreak = 0;
+			if (goal?.status === "waiting") {
+				const resumed: GoalState = { ...goal, status: "active", updatedAt: Date.now() };
+				delete resumed.waitReason;
+				persist(pi, ctx, resumed);
+				ctx.ui.notify(`Goal resumed by input: ${truncateObjective(resumed.objective)}`, "info");
+			}
+		}
 		activeTurnStartedAt = Date.now();
 		activeGoalThisTurnId = goal?.status === "active" ? goal.id : null;
 	});
@@ -434,6 +558,8 @@ export default function piGoal(pi: ExtensionAPI) {
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
 		const tokenDelta = tokenDeltaFromUsage((event.message as { usage?: UsageSnapshot } | undefined)?.usage);
+		if (turnIsContinuation) runStreak += 1;
+		turnIsContinuation = false;
 		const next = accountGoalTurn(goal, tokenDelta, elapsed);
 		persist(pi, ctx, next);
 		if (next.status === "budget_limited") {
@@ -442,22 +568,20 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", (event, ctx) => {
+		// A queued continuation that never started a turn must not mark the next one.
+		continuationTurnPending = false;
 		if (!goal || goal.status !== "active" || ctx.hasPendingMessages()) return;
 		const madeProgress = turnMadeProgress((event as { messages?: unknown }).messages);
-		const { next, action } = stallStreakStep(stallStreak, madeProgress, STALL_LIMIT);
-		stallStreak = next;
-		if (action === "continue") {
-			queueContinuation(pi, goal);
+		const step = stallStreakStep(stallStreak, madeProgress, STALL_LIMIT);
+		stallStreak = step.next;
+		if (step.action === "pause") {
+			parkGoal(pi, ctx, "stall");
 			return;
 		}
-		// action === "pause": stop re-feeding. persist() to paused resets the streak and stops
-		// continuation; the human resumes or clears. No goal event — feeding the LLM another prompt
-		// is exactly the burn we are stopping.
-		const paused: GoalState = { ...goal, status: "paused", updatedAt: Date.now() };
-		persist(pi, ctx, paused);
-		ctx.ui.notify(
-			`‖ Goal auto-paused after ${next} continuation turns with no tool use.\nThe loop was re-feeding the objective without acting. Use /goal resume to continue, or /goal clear to stop.\nObjective: ${truncateObjective(paused.objective)}`,
-			"warning",
-		);
+		if (runStreak >= RUN_LIMIT) {
+			parkGoal(pi, ctx, "run");
+			return;
+		}
+		queueContinuation(pi, goal);
 	});
 }
