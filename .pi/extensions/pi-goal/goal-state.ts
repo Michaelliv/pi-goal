@@ -1,10 +1,14 @@
-export type GoalStatus = "active" | "paused" | "budget_limited" | "complete";
+export type GoalStatus = "active" | "waiting" | "paused" | "budget_limited" | "complete";
+
+/** Why a goal is parked. Only set while status is waiting. */
+export type GoalWaitReason = "stall" | "run" | "model";
 
 export type GoalState = {
 	version: 1;
 	id: string;
 	objective: string;
 	status: GoalStatus;
+	waitReason?: GoalWaitReason;
 	tokenBudget: number | null;
 	tokensUsed: number;
 	timeUsedSeconds: number;
@@ -12,7 +16,7 @@ export type GoalState = {
 	updatedAt: number;
 };
 
-export type GoalEventKind = "active" | "continuation" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
+export type GoalEventKind = "active" | "continuation" | "waiting" | "paused" | "resumed" | "cleared" | "budget_limited" | "complete";
 
 export function parseTokenBudget(input: string): { objective: string; tokenBudget: number | null; error?: string } {
 	const match = input.match(/(?:^|\s)--tokens(?:=|\s+)(\S+\s*[kKmM]?)(?:\s|$)/);
@@ -59,6 +63,7 @@ export function statusLine(state: GoalState | null): string | undefined {
 	if (!state) return undefined;
 	const budget = state.tokenBudget ? ` (${formatTokens(state.tokensUsed)} / ${formatTokens(state.tokenBudget)})` : ` (${formatElapsed(state.timeUsedSeconds)})`;
 	if (state.status === "active") return `Pursuing goal${budget}`;
+	if (state.status === "waiting") return "Goal waiting for input (/goal resume)";
 	if (state.status === "paused") return "Goal paused (/goal resume)";
 	if (state.status === "budget_limited") return state.tokenBudget ? `Goal unmet${budget}` : "Goal abandoned";
 	return `Goal achieved${budget}`;
@@ -78,6 +83,7 @@ export function goalEventStatus(kind: GoalEventKind): string {
 	const labels: Record<GoalEventKind, string> = {
 		active: "active",
 		continuation: "continuing",
+		waiting: "waiting for input",
 		paused: "paused",
 		resumed: "resumed",
 		cleared: "cleared",
@@ -99,6 +105,61 @@ export function createGoalState(objective: string, tokenBudget: number | null, n
 		createdAt: now,
 		updatedAt: now,
 	};
+}
+
+// Goal-management tool calls are not progress: a runaway can spam get_goal/create_goal/update_goal
+// without doing real work. Only non-goal tool calls (edit/bash/write/read/...) count.
+export const GOAL_TOOL_NAMES: ReadonlySet<string> = new Set([
+	"get_goal",
+	"create_goal",
+	"update_goal",
+	"goal_wait",
+]);
+
+export const CONTINUATION_RUN_LIMIT_DEFAULT = 40;
+export const CONTINUATION_BACKOFF_BASE_MS = 5_000;
+export const CONTINUATION_BACKOFF_MAX_MS = 60_000;
+
+/** Delay before the next self-started turn. Zero while the loop still makes progress. */
+export function continuationDelayMs(stallStreak: number): number {
+	if (stallStreak <= 0) return 0;
+	return Math.min(CONTINUATION_BACKOFF_MAX_MS, CONTINUATION_BACKOFF_BASE_MS * 2 ** (stallStreak - 1));
+}
+
+// A continuation agent loop "made progress" if it called any tool other than the goal-management
+// tools. The runaway failure mode is the model narrating text (or only re-reading the goal) turn
+// after turn while the continuation prompt re-fires, burning tokens without acting.
+// Top-level non-array input fails open (return true) so a legitimate goal is never falsely paused.
+// A malformed per-message shape contributes no progress (fail-closed) — the SDK guarantees
+// content is an array on assistant messages, so the degenerate case does not occur in the field.
+export function turnMadeProgress(messages: unknown, goalToolNames: ReadonlySet<string> = GOAL_TOOL_NAMES): boolean {
+	if (!Array.isArray(messages)) return true;
+	for (const message of messages) {
+		const content = (message as { content?: unknown })?.content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			const b = block as { type?: unknown; name?: unknown };
+			if (b?.type === "toolCall" && typeof b.name === "string" && !goalToolNames.has(b.name)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+export type StallAction = "continue" | "pause";
+
+// Pure state machine for the stall-brake counter. Returns the next streak value and whether
+// to pause. Extracted so the full breaker logic (increment, threshold comparison, reset) is
+// unit-tested independent of the agent_end wiring.
+export function stallStreakStep(
+	streak: number,
+	madeProgress: boolean,
+	limit: number,
+): { next: number; action: StallAction } {
+	if (madeProgress) return { next: 0, action: "continue" };
+	const next = streak + 1;
+	return { next, action: next >= limit ? "pause" : "continue" };
 }
 
 export function accountGoalTurn(state: GoalState, tokenDelta: number, elapsedSeconds: number, now = Date.now()): GoalState {

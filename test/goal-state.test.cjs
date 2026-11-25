@@ -4,7 +4,10 @@ const { createJiti } = require("jiti");
 
 const jiti = createJiti(__filename);
 const {
+	CONTINUATION_BACKOFF_BASE_MS,
+	CONTINUATION_BACKOFF_MAX_MS,
 	accountGoalTurn,
+	continuationDelayMs,
 	createGoalState,
 	formatElapsed,
 	formatTokens,
@@ -14,7 +17,76 @@ const {
 	parseTokenBudget,
 	statusLine,
 	truncateObjective,
+	turnMadeProgress,
+	stallStreakStep,
+	GOAL_TOOL_NAMES,
 } = jiti("../.pi/extensions/pi-goal/goal-state.ts");
+
+const asstWith = (...blocks) => [{ role: "assistant", content: blocks }];
+
+test("statusLine reports a parked goal as waiting, recoverable by input", () => {
+	assert.equal(
+		statusLine({ status: "waiting", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 10 }),
+		"Goal waiting for input (/goal resume)",
+	);
+});
+
+test("continuationDelayMs is zero while the loop makes progress and backs off when stalled", () => {
+	assert.equal(continuationDelayMs(0), 0);
+	assert.equal(continuationDelayMs(1), CONTINUATION_BACKOFF_BASE_MS);
+	assert.equal(continuationDelayMs(2), CONTINUATION_BACKOFF_BASE_MS * 2);
+	assert.equal(continuationDelayMs(99), CONTINUATION_BACKOFF_MAX_MS);
+});
+
+test("goal_wait is not progress, so a park-only turn feeds the stall brake", () => {
+	assert.equal(turnMadeProgress(asstWith({ type: "toolCall", name: "goal_wait" })), false);
+});
+
+test("turnMadeProgress: true when a non-goal tool was called", () => {
+	assert.equal(turnMadeProgress(asstWith({ type: "toolCall", name: "bash" })), true);
+	assert.equal(turnMadeProgress(asstWith({ type: "text", text: "ok" }, { type: "toolCall", name: "edit" })), true);
+});
+
+test("turnMadeProgress: false for text-only or goal-tool-only loops (the runaway signature)", () => {
+	assert.equal(turnMadeProgress(asstWith({ type: "text", text: "still blocked, no change" })), false);
+	for (const name of GOAL_TOOL_NAMES) {
+		assert.equal(turnMadeProgress(asstWith({ type: "toolCall", name })), false);
+	}
+	assert.equal(turnMadeProgress([]), false);
+});
+
+test("turnMadeProgress: thinking-only turn is not progress", () => {
+	// ThinkingContent blocks must not be mistaken for tool calls
+	assert.equal(turnMadeProgress(asstWith({ type: "thinking", thinking: "I will plan..." })), false);
+	// Thinking + goal-tool-only is still no progress
+	assert.equal(turnMadeProgress(asstWith({ type: "thinking", thinking: "ok" }, { type: "toolCall", name: "get_goal" })), false);
+});
+
+test("turnMadeProgress: fails open on unknown/malformed shapes", () => {
+	assert.equal(turnMadeProgress(undefined), true);
+	assert.equal(turnMadeProgress(null), true);
+	assert.equal(turnMadeProgress("nope"), true);
+	assert.equal(turnMadeProgress([{ role: "assistant" }]), false); // no content array → no progress found
+});
+
+test("stallStreakStep: progress resets streak and returns continue", () => {
+	assert.deepEqual(stallStreakStep(0, true, 3), { next: 0, action: "continue" });
+	assert.deepEqual(stallStreakStep(2, true, 3), { next: 0, action: "continue" }); // reset mid-streak
+});
+
+test("stallStreakStep: no-progress increments and continues below limit", () => {
+	assert.deepEqual(stallStreakStep(0, false, 3), { next: 1, action: "continue" });
+	assert.deepEqual(stallStreakStep(1, false, 3), { next: 2, action: "continue" });
+});
+
+test("stallStreakStep: no-progress at limit triggers pause", () => {
+	assert.deepEqual(stallStreakStep(2, false, 3), { next: 3, action: "pause" }); // next === limit
+	assert.deepEqual(stallStreakStep(5, false, 3), { next: 6, action: "pause" }); // already past limit
+});
+
+test("stallStreakStep: limit=1 pauses on the very first no-progress turn", () => {
+	assert.deepEqual(stallStreakStep(0, false, 1), { next: 1, action: "pause" });
+});
 
 test("parseTokenBudget returns trimmed objective with no budget", () => {
 	assert.deepEqual(parseTokenBudget("  finish the migration  "), {
