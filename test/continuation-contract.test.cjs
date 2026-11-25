@@ -53,6 +53,13 @@ test("goal_wait parks the goal and is exposed only while a goal is active", () =
 	assert.match(indexSource, /status: "waiting",\s*waitReason: "model",/);
 });
 
+test("a user abort pauses the goal instead of letting the loop restart it", () => {
+	// Credits the unmerged upstream fix on fix/pause-on-escape (3078686).
+	assert.match(indexSource, /if \(message\?\.stopReason === "aborted"\) \{/);
+	assert.match(indexSource, /status: "paused", updatedAt: Date\.now\(\) \};\s*persist\(pi, ctx, aborted\);/);
+	assert.match(indexSource, /emitGoalEvent\(pi, "paused", aborted, \{ deliverAs: "nextTurn" \}\);/);
+});
+
 test("the continuation prompt offers goal_wait instead of a status-poll turn", () => {
 	assert.match(
 		indexSource,

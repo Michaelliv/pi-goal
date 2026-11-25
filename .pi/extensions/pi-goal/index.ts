@@ -557,10 +557,24 @@ export default function piGoal(pi: ExtensionAPI) {
 		const elapsed = activeTurnStartedAt ? Math.max(0, Math.round((Date.now() - activeTurnStartedAt) / 1000)) : 0;
 		activeTurnStartedAt = null;
 		activeGoalThisTurnId = null;
-		const tokenDelta = tokenDeltaFromUsage((event.message as { usage?: UsageSnapshot } | undefined)?.usage);
+		const message = event.message as { usage?: UsageSnapshot; stopReason?: string } | undefined;
+		const tokenDelta = tokenDeltaFromUsage(message?.usage);
 		if (turnIsContinuation) runStreak += 1;
 		turnIsContinuation = false;
 		const next = accountGoalTurn(goal, tokenDelta, elapsed);
+		// A user abort (Escape, /abort, ctx.abort()) must win over the loop. Without this the
+		// aborted turn ends, agent_end fires, and the loop restarts the next turn at once.
+		// Accounting stays: the tokens of an aborted turn were really spent.
+		if (message?.stopReason === "aborted") {
+			const aborted: GoalState = { ...next, status: "paused", updatedAt: Date.now() };
+			persist(pi, ctx, aborted);
+			emitGoalEvent(pi, "paused", aborted, { deliverAs: "nextTurn" });
+			ctx.ui.notify(
+				`‖ Goal paused after abort: ${truncateObjective(aborted.objective)}\nUse /goal resume to continue, or /goal clear to stop.`,
+				"info",
+			);
+			return;
+		}
 		persist(pi, ctx, next);
 		if (next.status === "budget_limited") {
 			emitGoalEvent(pi, "budget_limited", next, { triggerTurn: true, deliverAs: "followUp" });
